@@ -1,8 +1,12 @@
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "tesseract", "poppler_utils", "libGL", "zlib"]
+nixPkgs = ["python311Full", "tesseract", "poppler_utils", "libGL", "zlib"]
 
 [phases.install]
-cmds = ["python3.11 -m pip install -r requirements.txt"]
+cmds = [
+  "python3 -m ensurepip --upgrade",
+  "python3 -m pip install --upgrade pip",
+  "python3 -m pip install -r requirements.txt"
+]
 
 [start]
 cmd = "gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120"
