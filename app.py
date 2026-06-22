@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins=['https://oncue.health', 'https://www.oncue.health', 'http://localhost:5173'])
+CORS(app, origins=['https://oncue.health', 'https://www.oncue.health', 'http://localhost:5173', 'http://localhost:3000'])
 
 # ── Config ─────────────────────────────────────────────────────────────────
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
@@ -263,3 +263,94 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False)
 
+
+# ── Create user endpoint ────────────────────────────────────────────────────
+@app.route('/create-user', methods=['POST'])
+def create_user():
+    """
+    POST /create-user
+    Body: JSON { name, email, password, role, practice_id }
+    Creates a Supabase auth user + profile row server-side using service key
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return jsonify({'error': 'Supabase not configured'}), 500
+
+    data = request.get_json()
+    name        = data.get('name','').strip()
+    email       = data.get('email','').strip()
+    password    = data.get('password','')
+    role        = data.get('role','provider')
+    practice_id = data.get('practice_id')
+
+    if not name or not email or not password:
+        return jsonify({'error': 'name, email, and password are required'}), 400
+    if role not in ('provider','admin','superadmin'):
+        return jsonify({'error': 'Invalid role'}), 400
+
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # Create auth user
+        res = sb.auth.admin.create_user({
+            'email': email,
+            'password': password,
+            'email_confirm': True,
+            'user_metadata': {'name': name, 'role': role}
+        })
+
+        user_id = res.user.id
+
+        # Create profile row
+        sb.table('profiles').upsert({
+            'id':          user_id,
+            'name':        name,
+            'role':        role,
+            'practice_id': practice_id,
+            'active':      True,
+        }).execute()
+
+        log.info(f"Created user {email} ({role}) in practice {practice_id}")
+        return jsonify({'success': True, 'user_id': user_id, 'email': email})
+
+    except Exception as e:
+        log.error(f"Create user failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Delete practice endpoint ────────────────────────────────────────────────
+@app.route('/delete-practice', methods=['POST'])
+def delete_practice():
+    """
+    POST /delete-practice
+    Body: JSON { practice_id }
+    Deletes a practice (only if it has no patients)
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return jsonify({'error': 'Supabase not configured'}), 500
+
+    data        = request.get_json()
+    practice_id = data.get('practice_id')
+
+    if not practice_id:
+        return jsonify({'error': 'practice_id required'}), 400
+
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        # Safety check — don't delete if patients exist
+        patients = sb.table('patients').select('id').eq('practice_id', practice_id).execute()
+        if patients.data:
+            return jsonify({'error': f'Cannot delete — practice has {len(patients.data)} patients. Remove patients first.'}), 400
+
+        # Delete profiles first
+        sb.table('profiles').delete().eq('practice_id', practice_id).execute()
+        # Delete practice
+        sb.table('practices').delete().eq('id', practice_id).execute()
+
+        return jsonify({'success': True})
+
+    except Exception as e:
+        log.error(f"Delete practice failed: {e}")
+        return jsonify({'error': str(e)}), 500
