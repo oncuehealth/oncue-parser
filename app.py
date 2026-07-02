@@ -1,12 +1,15 @@
 """
 OnCue Health — Parser API
 Flask server that handles PDF upload, OCR parsing, and phone lookup
+Migrated from Supabase to Google Cloud SQL (PostgreSQL) — July 2026
 """
 
 import os
 import json
 import tempfile
 import logging
+import psycopg2
+import psycopg2.extras
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -25,17 +28,31 @@ CORS(app, origins=['https://oncue.health', 'https://www.oncue.health', 'http://l
 # ── Config ─────────────────────────────────────────────────────────────────
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN  = os.environ.get('TWILIO_AUTH_TOKEN')
-SUPABASE_URL       = os.environ.get('SUPABASE_URL')
-SUPABASE_KEY       = os.environ.get('SUPABASE_SERVICE_KEY')  # Service key for server-side writes
+CLOUD_SQL_URL      = os.environ.get('CLOUD_SQL_URL')   # postgresql://user:pass@host/dbname
 MAX_FILE_SIZE_MB   = 25
+
+# ── Database connection ─────────────────────────────────────────────────────
+def get_db():
+    """Get a Cloud SQL PostgreSQL connection."""
+    if not CLOUD_SQL_URL:
+        raise Exception('CLOUD_SQL_URL not configured')
+    return psycopg2.connect(CLOUD_SQL_URL)
 
 # ── Health check ────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
+    db_ok = False
+    try:
+        conn = get_db()
+        conn.close()
+        db_ok = True
+    except Exception as e:
+        log.warning(f"DB health check failed: {e}")
+
     return jsonify({
         'status': 'ok',
         'twilio': bool(TWILIO_ACCOUNT_SID),
-        'supabase': bool(SUPABASE_URL),
+        'database': db_ok,
     })
 
 # ── Parse PDF endpoint ──────────────────────────────────────────────────────
@@ -99,13 +116,12 @@ def parse():
                     looked_up.append({**patient, 'sms_capable': None, 'sms_number': patient.get('phone'), 'phone_type': 'unknown'})
                     lookup_errors += 1
             patients = looked_up
-            stats['sms_capable']     = sum(1 for p in patients if p.get('sms_capable') is True)
-            stats['landline_only']   = sum(1 for p in patients if p.get('sms_capable') is False)
-            stats['lookup_errors']   = lookup_errors
-            stats['two_phones_found']= sum(1 for p in patients if p.get('phone2'))
+            stats['sms_capable']      = sum(1 for p in patients if p.get('sms_capable') is True)
+            stats['landline_only']    = sum(1 for p in patients if p.get('sms_capable') is False)
+            stats['lookup_errors']    = lookup_errors
+            stats['two_phones_found'] = sum(1 for p in patients if p.get('phone2'))
             log.info(f"Lookup complete: {stats['sms_capable']} SMS-capable, {stats['landline_only']} landline only")
         else:
-            # No lookup — mark all as unknown
             for p in patients:
                 p['sms_capable']     = None
                 p['sms_number']      = p.get('phone')
@@ -113,7 +129,6 @@ def parse():
                 p['phone_type']      = 'unknown'
                 p['phone2_type']     = 'unknown' if p.get('phone2') else None
 
-        # Add practice/provider IDs
         for p in patients:
             p['practice_id'] = practice_id
             p['provider_id'] = provider_id
@@ -143,11 +158,8 @@ def save_patients():
     """
     POST /save
     Body: JSON { patients: [...], practice_id, provider_id }
-    Saves parsed patients to Supabase
+    Saves parsed patients to Cloud SQL
     """
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return jsonify({'error': 'Supabase not configured'}), 500
-
     data        = request.get_json()
     patients    = data.get('patients', [])
     practice_id = data.get('practice_id')
@@ -156,40 +168,168 @@ def save_patients():
     if not patients:
         return jsonify({'error': 'No patients provided'}), 400
 
-    from supabase import create_client
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    rows = []
-    for p in patients:
-        rows.append({
-            'practice_id':   practice_id or p.get('practice_id'),
-            'provider_id':   provider_id or p.get('provider_id'),
-            'name':          p.get('name','').strip(),
-            'patient_no':    p.get('patient_no','').strip() or None,
-            'dob':           p.get('dob') or None,
-            'phone':         p.get('sms_number') or p.get('phone',''),
-            'phone_type':    p.get('sms_number_type') or p.get('phone_type','unknown'),
-            'phone2':        p.get('phone2') or None,
-            'phone2_type':   p.get('phone2_type') or None,
-            'sms_capable':   p.get('sms_capable'),
-            'procedure':     p.get('procedure','Colonoscopy'),
-            'recall_date':   p.get('recall_date') or None,
-            'status':        p.get('status','ready'),
-            'comments':      p.get('comments','').strip() or None,
-            'flags':         p.get('flags',[]),
-            'confidence':    p.get('confidence','high'),
-        })
-
     try:
-        result = sb.table('patients').insert(rows).execute()
-        return jsonify({
-            'success': True,
-            'saved':   len(result.data),
-        })
+        conn = get_db()
+        cur  = conn.cursor()
+
+        insert_sql = """
+            INSERT INTO patients (
+                practice_id, provider_id, name, patient_no, dob,
+                phone, phone_type, phone2, phone2_type, sms_number,
+                sms_capable, procedure, recall_date, status,
+                comments, flags, confidence
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s
+            )
+        """
+
+        rows = []
+        for p in patients:
+            rows.append((
+                practice_id or p.get('practice_id'),
+                provider_id or p.get('provider_id'),
+                p.get('name', '').strip(),
+                p.get('patient_no', '').strip() or None,
+                p.get('dob') or None,
+                p.get('sms_number') or p.get('phone', ''),
+                p.get('sms_number_type') or p.get('phone_type', 'unknown'),
+                p.get('phone2') or None,
+                p.get('phone2_type') or None,
+                p.get('sms_number') or p.get('phone', ''),
+                p.get('sms_capable'),
+                p.get('procedure', 'Colonoscopy'),
+                p.get('recall_date') or None,
+                p.get('status', 'ready'),
+                p.get('comments', '').strip() or None,
+                p.get('flags', []),
+                p.get('confidence', 'high'),
+            ))
+
+        cur.executemany(insert_sql, rows)
+        conn.commit()
+        saved = cur.rowcount if cur.rowcount > 0 else len(rows)
+
+        cur.close()
+        conn.close()
+
+        log.info(f"Saved {saved} patients to Cloud SQL")
+        return jsonify({'success': True, 'saved': saved})
+
     except Exception as e:
-        log.error(f"Supabase save failed: {e}")
+        log.error(f"Cloud SQL save failed: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+# ── Create user endpoint ────────────────────────────────────────────────────
+@app.route('/create-user', methods=['POST'])
+def create_user():
+    """
+    POST /create-user
+    Body: JSON { name, email, password, role, practice_id }
+    Creates a Firebase auth user + profile row in Cloud SQL
+    """
+    data        = request.get_json()
+    name        = data.get('name', '').strip()
+    email       = data.get('email', '').strip()
+    password    = data.get('password', '')
+    role        = data.get('role', 'provider')
+    practice_id = data.get('practice_id')
+
+    if not name or not email or not password:
+        return jsonify({'error': 'name, email, and password are required'}), 400
+    if role not in ('provider', 'admin', 'superadmin'):
+        return jsonify({'error': 'Invalid role'}), 400
+
+    try:
+        # Create Firebase auth user
+        import firebase_admin
+        from firebase_admin import auth as firebase_auth, credentials
+
+        # Initialize Firebase app if not already done
+        if not firebase_admin._apps:
+            service_account = json.loads(os.environ.get('FIREBASE_SERVICE_ACCOUNT', '{}'))
+            cred = credentials.Certificate(service_account)
+            firebase_admin.initialize_app(cred)
+
+        firebase_user = firebase_auth.create_user(
+            email=email,
+            password=password,
+            display_name=name,
+        )
+        user_id = firebase_user.uid
+        log.info(f"Created Firebase user {email} with uid {user_id}")
+
+        # Insert profile into Cloud SQL
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO profiles (id, name, email, role, practice_id, active)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                role = EXCLUDED.role,
+                practice_id = EXCLUDED.practice_id,
+                active = EXCLUDED.active
+        """, (user_id, name, email, role, practice_id, True))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        log.info(f"Created profile for {email} ({role}) in practice {practice_id}")
+        return jsonify({'success': True, 'user_id': user_id, 'email': email})
+
+    except Exception as e:
+        log.error(f"Create user failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Delete practice endpoint ────────────────────────────────────────────────
+@app.route('/delete-practice', methods=['POST'])
+def delete_practice():
+    """
+    POST /delete-practice
+    Body: JSON { practice_id }
+    Deletes a practice and its profiles (only if no patients exist)
+    """
+    data        = request.get_json()
+    practice_id = data.get('practice_id')
+
+    if not practice_id:
+        return jsonify({'error': 'practice_id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+
+        # Safety check — don't delete if patients exist
+        cur.execute("SELECT COUNT(*) FROM patients WHERE practice_id = %s", (practice_id,))
+        patient_count = cur.fetchone()[0]
+        if patient_count > 0:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Cannot delete — practice has {patient_count} patients. Remove patients first.'}), 400
+
+        # Delete profiles first (foreign key)
+        cur.execute("DELETE FROM profiles WHERE practice_id = %s", (practice_id,))
+        # Delete practice
+        cur.execute("DELETE FROM practices WHERE id = %s", (practice_id,))
+        conn.commit()
+
+        cur.close()
+        conn.close()
+
+        log.info(f"Deleted practice {practice_id}")
+        return jsonify({'success': True})
+
+    except Exception as e:
+        log.error(f"Delete practice failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── CSV parser helper ───────────────────────────────────────────────────────
 def parse_recall_csv(csv_path):
     """Parse a CSV recall export"""
     import csv
@@ -197,12 +337,10 @@ def parse_recall_csv(csv_path):
 
     with open(csv_path, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
-        headers = [h.lower().strip() for h in reader.fieldnames or []]
 
         for row in reader:
             row_lower = {k.lower().strip(): v for k, v in row.items()}
 
-            # Try to find name column
             name = (row_lower.get('patient name') or row_lower.get('name') or
                     row_lower.get('patient') or '')
             phone = (row_lower.get('home phone') or row_lower.get('phone') or
@@ -218,9 +356,9 @@ def parse_recall_csv(csv_path):
                 continue
 
             from parser import clean_phone, detect_flags
-            phones = []
             p1 = clean_phone(phone)
             p2 = clean_phone(phone2)
+            phones = []
             if p1: phones.append({'number': p1, 'label': 'home'})
             if p2: phones.append({'number': p2, 'label': 'work'})
 
@@ -243,8 +381,8 @@ def parse_recall_csv(csv_path):
                 'confidence':  'high' if name and p1 else 'low',
             })
 
-    low  = [p for p in patients if p['confidence']=='low']
-    high = [p for p in patients if p['confidence']=='high']
+    low  = [p for p in patients if p['confidence'] == 'low']
+    high = [p for p in patients if p['confidence'] == 'high']
 
     return {
         'patients':      patients,
@@ -259,98 +397,7 @@ def parse_recall_csv(csv_path):
         'errors': [],
     }
 
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
-# ── Create user endpoint ────────────────────────────────────────────────────
-@app.route('/create-user', methods=['POST'])
-def create_user():
-    """
-    POST /create-user
-    Body: JSON { name, email, password, role, practice_id }
-    Creates a Supabase auth user + profile row server-side using service key
-    """
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return jsonify({'error': 'Supabase not configured'}), 500
-
-    data = request.get_json()
-    name        = data.get('name','').strip()
-    email       = data.get('email','').strip()
-    password    = data.get('password','')
-    role        = data.get('role','provider')
-    practice_id = data.get('practice_id')
-
-    if not name or not email or not password:
-        return jsonify({'error': 'name, email, and password are required'}), 400
-    if role not in ('provider','admin','superadmin'):
-        return jsonify({'error': 'Invalid role'}), 400
-
-    try:
-        from supabase import create_client
-        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-        # Create auth user
-        res = sb.auth.admin.create_user({
-            'email': email,
-            'password': password,
-            'email_confirm': True,
-            'user_metadata': {'name': name, 'role': role}
-        })
-
-        user_id = res.user.id
-
-        # Create profile row
-        sb.table('profiles').upsert({
-            'id':          user_id,
-            'name':        name,
-            'role':        role,
-            'practice_id': practice_id,
-            'active':      True,
-        }).execute()
-
-        log.info(f"Created user {email} ({role}) in practice {practice_id}")
-        return jsonify({'success': True, 'user_id': user_id, 'email': email})
-
-    except Exception as e:
-        log.error(f"Create user failed: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-# ── Delete practice endpoint ────────────────────────────────────────────────
-@app.route('/delete-practice', methods=['POST'])
-def delete_practice():
-    """
-    POST /delete-practice
-    Body: JSON { practice_id }
-    Deletes a practice (only if it has no patients)
-    """
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return jsonify({'error': 'Supabase not configured'}), 500
-
-    data        = request.get_json()
-    practice_id = data.get('practice_id')
-
-    if not practice_id:
-        return jsonify({'error': 'practice_id required'}), 400
-
-    try:
-        from supabase import create_client
-        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-        # Safety check — don't delete if patients exist
-        patients = sb.table('patients').select('id').eq('practice_id', practice_id).execute()
-        if patients.data:
-            return jsonify({'error': f'Cannot delete — practice has {len(patients.data)} patients. Remove patients first.'}), 400
-
-        # Delete profiles first
-        sb.table('profiles').delete().eq('practice_id', practice_id).execute()
-        # Delete practice
-        sb.table('practices').delete().eq('id', practice_id).execute()
-
-        return jsonify({'success': True})
-
-    except Exception as e:
-        log.error(f"Delete practice failed: {e}")
-        return jsonify({'error': str(e)}), 500
