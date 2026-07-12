@@ -55,16 +55,62 @@ def get_twilio():
 
 
 def log_conversation(cur, practice_id, patient_id, direction, body, twilio_sid=None, status=None):
-    """
-    Insert a row into sms_conversations.
-    NOTE: verify these column names match your actual sms_conversations schema —
-    adjust the INSERT below if your table differs.
-    """
+    """Insert a row into sms_conversations."""
     cur.execute("""
         INSERT INTO sms_conversations (
             practice_id, patient_id, direction, body, twilio_sid, status, created_at
         ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
     """, (practice_id, patient_id, direction, body, twilio_sid, status))
+
+
+# ── Message template system ─────────────────────────────────────────────────
+# Default opening message. Practices can override this via /templates.
+# Placeholders: {patient_name} {doctor_name} {practice_name} {procedure}
+DEFAULT_TEMPLATE = (
+    "Hi {patient_name}, this is Dr. {doctor_name} from {practice_name}. We see that you are "
+    "due for your {procedure}. We would love to help you get it scheduled in an expedited and "
+    "efficient manner. Are you able to answer some questions so that we can get it scheduled?"
+)
+
+def get_template_for_practice(cur, practice_id):
+    """Look up a practice's custom template, falling back to the default."""
+    if practice_id:
+        cur.execute("SELECT template_text FROM message_templates WHERE practice_id = %s", (practice_id,))
+        row = cur.fetchone()
+        if row:
+            return row['template_text']
+    return DEFAULT_TEMPLATE
+
+
+def render_template(template_text, patient_name=None, doctor_name=None, practice_name=None, procedure=None):
+    return (
+        template_text
+        .replace('{patient_name}', patient_name or 'there')
+        .replace('{doctor_name}', doctor_name or 'your provider')
+        .replace('{practice_name}', practice_name or 'your medical practice')
+        .replace('{procedure}', procedure or 'screening')
+    )
+
+
+# ── Conversation flow (asked in order after patient replies YES) ────────────
+# Each entry: (conversation_state key, question text, patients column the answer is saved to)
+QUESTION_FLOW = [
+    ('q_dob',          "Can you confirm your date of birth (MM/DD/YYYY)?",                                                    'dob_confirmed'),
+    ('q_callback',     "What's the best callback number to reach you at?",                                                    'callback_number'),
+    ('q_address',      "What is your current mailing address?",                                                               'updated_address'),
+    ('q_allergies',    "Do you have any medication allergies? Reply NONE if not.",                                            'allergies'),
+    ('q_bloodthinner', "Are you currently taking any blood thinners or GLP-1 medications (e.g. Ozempic, Wegovy, Trulicity)? Reply NONE if not.", 'blood_thinner_glp1'),
+    ('q_insurance',    "What insurance do you have? Please include the provider name and member ID if you have it handy.",    'insurance_info'),
+    ('q_preference',   "Do you have a preference for appointment date or time?",                                              'scheduling_preference'),
+]
+QUESTION_STATES  = [q[0] for q in QUESTION_FLOW]
+QUESTION_TEXT    = {q[0]: q[1] for q in QUESTION_FLOW}
+QUESTION_COLUMN  = {q[0]: q[2] for q in QUESTION_FLOW}
+
+CALL_REQUEST_KEYWORDS = ('CALL', 'PHONE', 'SPEAK', 'TALK')
+YES_KEYWORDS          = ('YES', 'Y', 'SURE', 'OK', 'OKAY')
+NO_KEYWORDS           = ('NO', 'N')
+STOP_KEYWORDS         = ('STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'OPTOUT', 'REVOKE')
 
 # ── Health check ────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
@@ -104,7 +150,13 @@ def sms_send():
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM patients WHERE id = %s", (patient_id,))
+        cur.execute("""
+            SELECT p.*, pr.name AS doctor_name, prac.name AS practice_name
+            FROM patients p
+            LEFT JOIN profiles pr   ON pr.id   = p.provider_id
+            LEFT JOIN practices prac ON prac.id = p.practice_id
+            WHERE p.id = %s
+        """, (patient_id,))
         patient = cur.fetchone()
 
         if not patient:
@@ -119,10 +171,14 @@ def sms_send():
             return jsonify({'error': 'Patient has no phone number on file'}), 400
 
         if not message:
-            message = (
-                f"Hi {patient.get('name', '').split(' ')[0] or 'there'}, this is your medical "
-                f"practice via OnCue Health. You are due for a {patient.get('procedure', 'screening')}. "
-                f"Reply YES to confirm interest in scheduling or STOP to opt out."
+            template = get_template_for_practice(cur, patient.get('practice_id'))
+            first_name = (patient.get('name') or '').split(' ')[0]
+            message = render_template(
+                template,
+                patient_name=first_name,
+                doctor_name=patient.get('doctor_name'),
+                practice_name=patient.get('practice_name'),
+                procedure=patient.get('procedure'),
             )
 
         client = get_twilio()
@@ -141,7 +197,10 @@ def sms_send():
             twilio_sid=msg.sid,
             status=msg.status,
         )
-        cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('sms_sent', patient_id))
+        cur.execute(
+            "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+            ('sms_sent', 'awaiting_consent', patient_id),
+        )
         conn.commit()
         cur.close()
         conn.close()
@@ -180,7 +239,13 @@ def sms_send_bulk():
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
         for patient_id in patient_ids:
-            cur.execute("SELECT * FROM patients WHERE id = %s", (patient_id,))
+            cur.execute("""
+                SELECT p.*, pr.name AS doctor_name, prac.name AS practice_name
+                FROM patients p
+                LEFT JOIN profiles pr    ON pr.id   = p.provider_id
+                LEFT JOIN practices prac ON prac.id = p.practice_id
+                WHERE p.id = %s
+            """, (patient_id,))
             patient = cur.fetchone()
 
             if not patient:
@@ -192,11 +257,18 @@ def sms_send_bulk():
                 results.append({'patient_id': patient_id, 'success': False, 'error': 'no phone on file'})
                 continue
 
-            body = message or (
-                f"Hi {patient.get('name', '').split(' ')[0] or 'there'}, this is your medical "
-                f"practice via OnCue Health. You are due for a {patient.get('procedure', 'screening')}. "
-                f"Reply YES to confirm interest in scheduling or STOP to opt out."
-            )
+            if message:
+                body = message
+            else:
+                template = get_template_for_practice(cur, patient.get('practice_id'))
+                first_name = (patient.get('name') or '').split(' ')[0]
+                body = render_template(
+                    template,
+                    patient_name=first_name,
+                    doctor_name=patient.get('doctor_name'),
+                    practice_name=patient.get('practice_name'),
+                    procedure=patient.get('procedure'),
+                )
 
             try:
                 msg = client.messages.create(
@@ -213,7 +285,10 @@ def sms_send_bulk():
                     twilio_sid=msg.sid,
                     status=msg.status,
                 )
-                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('sms_sent', patient_id))
+                cur.execute(
+                    "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                    ('sms_sent', 'awaiting_consent', patient_id),
+                )
                 results.append({'patient_id': patient_id, 'success': True, 'twilio_sid': msg.sid})
             except Exception as e:
                 log.warning(f"Bulk SMS failed for patient {patient_id}: {e}")
@@ -259,8 +334,10 @@ def sms_webhook():
     from_number = request.form.get('From', '')
     body        = (request.form.get('Body') or '').strip()
     message_sid = request.form.get('MessageSid', '')
+    body_upper  = body.upper()
 
     resp = MessagingResponse()
+    reply_text = None
 
     try:
         conn = get_db()
@@ -274,6 +351,7 @@ def sms_webhook():
 
         patient_id  = patient['id'] if patient else None
         practice_id = patient.get('practice_id') if patient else None
+        state       = (patient.get('conversation_state') if patient else None) or 'not_started'
 
         log_conversation(
             cur,
@@ -285,28 +363,186 @@ def sms_webhook():
             status='received',
         )
 
-        body_upper = body.upper()
-        if patient_id:
-            if body_upper in ('YES', 'Y', 'CONFIRM'):
-                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('confirmed', patient_id))
-            elif body_upper in ('STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'OPTOUT', 'REVOKE'):
-                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('opted_out', patient_id))
-            elif body_upper in ('NO', 'N'):
-                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('declined', patient_id))
-            else:
-                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('replied', patient_id))
+        if patient_id and state not in ('opted_out',):
+
+            # Patient wants to talk on the phone instead of texting — works at any stage
+            if any(kw in body_upper for kw in CALL_REQUEST_KEYWORDS):
+                cur.execute(
+                    "UPDATE patients SET status = %s, conversation_state = %s, contact_preference = %s WHERE id = %s",
+                    ('ready_to_schedule_call_requested', 'call_requested', 'call', patient_id),
+                )
+                reply_text = "Got it — we'll have someone from the practice give you a call to go over scheduling. Thank you!"
+
+            elif body_upper in STOP_KEYWORDS:
+                cur.execute(
+                    "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                    ('opted_out', 'opted_out', patient_id),
+                )
+                # Twilio already sends the carrier-required opt-out confirmation; no extra reply needed.
+
+            elif state in ('not_started', 'awaiting_consent'):
+                if body_upper in YES_KEYWORDS:
+                    first_q_state = QUESTION_STATES[0]
+                    cur.execute(
+                        "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                        ('answering_questions', first_q_state, patient_id),
+                    )
+                    reply_text = QUESTION_TEXT[first_q_state]
+                elif body_upper in NO_KEYWORDS:
+                    cur.execute(
+                        "UPDATE patients SET conversation_state = %s WHERE id = %s",
+                        ('awaiting_reschedule_pref', patient_id),
+                    )
+                    reply_text = (
+                        "No problem. Would you like us to reach out again at a later date, "
+                        "or would you prefer not to schedule at this time? Reply LATER or NOT NOW."
+                    )
+                else:
+                    reply_text = (
+                        "Sorry, I didn't quite catch that — reply YES if you're able to answer a "
+                        "few quick questions to get scheduled, or NO if not right now."
+                    )
+
+            elif state == 'awaiting_reschedule_pref':
+                if 'LATER' in body_upper:
+                    cur.execute(
+                        "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                        ('follow_up_later', 'follow_up_later', patient_id),
+                    )
+                    reply_text = "Understood — we'll reach back out at a later date. Thank you!"
+                else:
+                    cur.execute(
+                        "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                        ('declined', 'declined', patient_id),
+                    )
+                    reply_text = "No problem, thank you for letting us know."
+
+            elif state in QUESTION_STATES:
+                # Save the answer to this question's column
+                column = QUESTION_COLUMN[state]
+                cur.execute(f"UPDATE patients SET {column} = %s WHERE id = %s", (body, patient_id))
+
+                idx = QUESTION_STATES.index(state)
+                if idx + 1 < len(QUESTION_STATES):
+                    next_state = QUESTION_STATES[idx + 1]
+                    cur.execute("UPDATE patients SET conversation_state = %s WHERE id = %s", (next_state, patient_id))
+                    reply_text = QUESTION_TEXT[next_state]
+                else:
+                    cur.execute(
+                        "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                        ('ready_to_schedule', 'complete', patient_id),
+                    )
+                    reply_text = (
+                        "Thank you! We have everything we need — our scheduling team will follow up "
+                        "shortly to confirm your appointment."
+                    )
+            # else: state is 'complete', 'declined', 'follow_up_later', or 'call_requested' —
+            # conversation already finished, just log the message, no auto-reply.
+
+        if reply_text:
+            resp.message(reply_text)
+            log_conversation(
+                cur,
+                practice_id=practice_id,
+                patient_id=patient_id,
+                direction='outbound',
+                body=reply_text,
+                status='auto_reply',
+            )
 
         conn.commit()
         cur.close()
         conn.close()
 
-        log.info(f"Inbound SMS from {from_number}: '{body}' (patient_id={patient_id})")
+        log.info(f"Inbound SMS from {from_number}: '{body}' (patient_id={patient_id}, state was {state})")
 
     except Exception as e:
         log.error(f"Inbound webhook processing failed: {e}", exc_info=True)
         # Still return valid empty TwiML so Twilio doesn't retry endlessly
 
     return str(resp), 200, {'Content-Type': 'text/xml'}
+
+
+# ── Message templates (per practice) ──────────────────────────────────────────
+@app.route('/practices', methods=['GET'])
+def get_practices():
+    """GET /practices — list all practices (id, name) for dropdowns/selectors."""
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, name FROM practices ORDER BY name")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        log.error(f"Get practices failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/templates', methods=['GET'])
+def get_template_route():
+    """
+    GET /templates?practice_id=xxx
+    Returns the practice's custom template if one exists, otherwise the default,
+    with is_default flagging which one it is.
+    """
+    practice_id = request.args.get('practice_id')
+    if not practice_id:
+        return jsonify({'error': 'practice_id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM message_templates WHERE practice_id = %s", (practice_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row:
+            return jsonify({**dict(row), 'is_default': False})
+        return jsonify({'practice_id': practice_id, 'template_text': DEFAULT_TEMPLATE, 'is_default': True})
+
+    except Exception as e:
+        log.error(f"Get template failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/templates', methods=['POST'])
+def save_template_route():
+    """
+    POST /templates
+    Body: JSON { practice_id, template_text }
+    Creates or updates a practice's custom opening message template.
+    Supports placeholders: {patient_name} {doctor_name} {practice_name} {procedure}
+    """
+    data          = request.get_json()
+    practice_id   = data.get('practice_id')
+    template_text = data.get('template_text')
+
+    if not practice_id or not template_text:
+        return jsonify({'error': 'practice_id and template_text required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            INSERT INTO message_templates (practice_id, template_text, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (practice_id) DO UPDATE SET
+                template_text = EXCLUDED.template_text,
+                updated_at    = NOW()
+            RETURNING *
+        """, (practice_id, template_text))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(dict(row))
+
+    except Exception as e:
+        log.error(f"Save template failed: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 # ── Get conversation history for a patient ───────────────────────────────────
