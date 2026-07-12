@@ -5,6 +5,7 @@ Migrated from Supabase to Google Cloud SQL (PostgreSQL) — July 2026
 """
 
 import os
+import re
 import json
 import tempfile
 import logging
@@ -85,10 +86,17 @@ def get_template_for_practice(cur, practice_id):
 
 
 def render_template(template_text, patient_name=None, doctor_name=None, practice_name=None, procedure=None):
+    # Provider names are often stored as "Dr. Jane Smith" already. Since templates
+    # typically write "this is Dr. {doctor_name}", strip any leading "Dr."/"Dr" so
+    # we don't end up with "Dr. Dr. Jane Smith".
+    clean_doctor_name = doctor_name
+    if clean_doctor_name:
+        clean_doctor_name = re.sub(r'^\s*dr\.?\s+', '', clean_doctor_name, flags=re.IGNORECASE)
+
     return (
         template_text
         .replace('{patient_name}', patient_name or 'there')
-        .replace('{doctor_name}', doctor_name or 'your provider')
+        .replace('{doctor_name}', clean_doctor_name or 'your provider')
         .replace('{practice_name}', practice_name or 'your medical practice')
         .replace('{procedure}', procedure or 'screening')
     )
