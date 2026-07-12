@@ -476,17 +476,65 @@ def sms_webhook():
 # ── Message templates (per practice) ──────────────────────────────────────────
 @app.route('/practices', methods=['GET'])
 def get_practices():
-    """GET /practices — list all practices (id, name) for dropdowns/selectors."""
+    """
+    GET /practices — list all practices with provider/patient counts
+    (used by the superadmin practice list and dropdowns/selectors elsewhere).
+    """
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT id, name FROM practices ORDER BY name")
+        cur.execute("""
+            SELECT
+                p.id, p.name, p.address, p.phone, p.specialty, p.created_at,
+                COUNT(DISTINCT pr.id) FILTER (WHERE pr.role = 'provider') AS provider_count,
+                COUNT(DISTINCT pt.id) AS patient_count
+            FROM practices p
+            LEFT JOIN profiles pr ON pr.practice_id = p.id
+            LEFT JOIN patients pt ON pt.practice_id = p.id
+            GROUP BY p.id
+            ORDER BY p.name
+        """)
         rows = cur.fetchall()
         cur.close()
         conn.close()
         return jsonify([dict(r) for r in rows])
     except Exception as e:
         log.error(f"Get practices failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/practices', methods=['POST'])
+def create_practice():
+    """
+    POST /practices
+    Body: JSON { name, address, phone, specialty }
+    Creates a new practice.
+    """
+    data      = request.get_json()
+    name      = (data.get('name') or '').strip()
+    address   = data.get('address') or None
+    phone     = data.get('phone') or None
+    specialty = data.get('specialty') or None
+
+    if not name:
+        return jsonify({'error': 'name required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            INSERT INTO practices (name, address, phone, specialty)
+            VALUES (%s, %s, %s, %s)
+            RETURNING *
+        """, (name, address, phone, specialty))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        log.info(f"Created practice {name} ({row['id']})")
+        return jsonify(dict(row))
+    except Exception as e:
+        log.error(f"Create practice failed: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -895,20 +943,24 @@ def get_profile():
 @app.route('/patients', methods=['GET'])
 def get_patients():
     """
-    GET /patients?practice_id=xxx&provider_id=xxx
-    Returns patients for a practice or provider
+    GET /patients?practice_id=xxx        → patients for one practice
+    GET /patients?provider_id=xxx        → patients for one provider
+    GET /patients?all=true               → every patient across every practice (superadmin use)
     """
     practice_id = request.args.get('practice_id')
     provider_id = request.args.get('provider_id')
+    all_flag    = request.args.get('all') == 'true'
 
-    if not practice_id and not provider_id:
-        return jsonify({'error': 'practice_id or provider_id required'}), 400
+    if not practice_id and not provider_id and not all_flag:
+        return jsonify({'error': 'practice_id, provider_id, or all=true required'}), 400
 
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        if practice_id:
+        if all_flag:
+            cur.execute("SELECT * FROM patients ORDER BY recall_date")
+        elif practice_id:
             cur.execute("SELECT * FROM patients WHERE practice_id = %s ORDER BY recall_date", (practice_id,))
         else:
             cur.execute("SELECT * FROM patients WHERE provider_id = %s ORDER BY recall_date", (provider_id,))
@@ -928,17 +980,37 @@ def get_patients():
 @app.route('/providers', methods=['GET'])
 def get_providers():
     """
-    GET /providers?practice_id=xxx
-    Returns providers for a practice
+    GET /providers?practice_id=xxx   → providers for one practice
+    GET /providers?all=true          → every provider across every practice (superadmin use)
+    Returns id, name, email, role, active, practice_id, practice_name.
     """
     practice_id = request.args.get('practice_id')
-    if not practice_id:
-        return jsonify({'error': 'practice_id required'}), 400
+    all_flag    = request.args.get('all') == 'true'
+    role_filter = request.args.get('role', 'provider')  # 'provider' (default), 'all', or a specific role
+
+    if not practice_id and not all_flag:
+        return jsonify({'error': 'practice_id or all=true required'}), 400
 
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT id, name FROM profiles WHERE practice_id = %s AND role = 'provider'", (practice_id,))
+        base_sql = """
+            SELECT pr.id, pr.name, pr.email, pr.role, pr.active, pr.practice_id, p.name AS practice_name
+            FROM profiles pr
+            LEFT JOIN practices p ON p.id = pr.practice_id
+            WHERE 1=1
+        """
+        params = []
+        if role_filter != 'all':
+            base_sql += " AND pr.role = %s"
+            params.append(role_filter)
+        if practice_id:
+            base_sql += " AND pr.practice_id = %s ORDER BY pr.name"
+            params.append(practice_id)
+        else:
+            base_sql += " ORDER BY p.name, pr.name"
+
+        cur.execute(base_sql, params)
         rows = cur.fetchall()
         cur.close()
         conn.close()
