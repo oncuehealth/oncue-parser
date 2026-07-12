@@ -13,6 +13,9 @@ import psycopg2.extras
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+from twilio.rest import Client as TwilioClient
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.request_validator import RequestValidator
 
 load_dotenv()
 
@@ -26,10 +29,11 @@ app = Flask(__name__)
 CORS(app, origins=['https://oncue.health', 'https://www.oncue.health', 'http://localhost:5173', 'http://localhost:3000'])
 
 # ── Config ─────────────────────────────────────────────────────────────────
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN  = os.environ.get('TWILIO_AUTH_TOKEN')
-CLOUD_SQL_URL      = os.environ.get('CLOUD_SQL_URL')   # postgresql://user:pass@host/dbname
-MAX_FILE_SIZE_MB   = 25
+TWILIO_ACCOUNT_SID           = os.environ.get('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN            = os.environ.get('TWILIO_AUTH_TOKEN')
+TWILIO_MESSAGING_SERVICE_SID = os.environ.get('TWILIO_MESSAGING_SERVICE_SID')  # MG7463d868c79cdf525c11ae3a1e0a69d1
+CLOUD_SQL_URL                = os.environ.get('CLOUD_SQL_URL')   # postgresql://user:pass@host/dbname
+MAX_FILE_SIZE_MB             = 25
 
 # ── Database connection ─────────────────────────────────────────────────────
 def get_db():
@@ -37,6 +41,30 @@ def get_db():
     if not CLOUD_SQL_URL:
         raise Exception('CLOUD_SQL_URL not configured')
     return psycopg2.connect(CLOUD_SQL_URL)
+
+# ── Twilio client ────────────────────────────────────────────────────────────
+_twilio_client = None
+def get_twilio():
+    """Lazily create a single shared Twilio REST client."""
+    global _twilio_client
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        raise Exception('TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not configured')
+    if _twilio_client is None:
+        _twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return _twilio_client
+
+
+def log_conversation(cur, practice_id, patient_id, direction, body, twilio_sid=None, status=None):
+    """
+    Insert a row into sms_conversations.
+    NOTE: verify these column names match your actual sms_conversations schema —
+    adjust the INSERT below if your table differs.
+    """
+    cur.execute("""
+        INSERT INTO sms_conversations (
+            practice_id, patient_id, direction, body, twilio_sid, status, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+    """, (practice_id, patient_id, direction, body, twilio_sid, status))
 
 # ── Health check ────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
@@ -54,6 +82,259 @@ def health():
         'twilio': bool(TWILIO_ACCOUNT_SID),
         'database': db_ok,
     })
+
+# ── Send single SMS ──────────────────────────────────────────────────────────
+@app.route('/sms/send', methods=['POST'])
+def sms_send():
+    """
+    POST /sms/send
+    Body: JSON { patient_id, message } — 'message' overrides the default template
+    Sends a recall SMS to one patient via the Twilio Messaging Service and
+    logs the outbound message to sms_conversations.
+    """
+    data       = request.get_json()
+    patient_id = data.get('patient_id')
+    message    = data.get('message')
+
+    if not patient_id:
+        return jsonify({'error': 'patient_id required'}), 400
+    if not TWILIO_MESSAGING_SERVICE_SID:
+        return jsonify({'error': 'TWILIO_MESSAGING_SERVICE_SID not configured'}), 500
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM patients WHERE id = %s", (patient_id,))
+        patient = cur.fetchone()
+
+        if not patient:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Patient not found'}), 404
+
+        to_number = patient.get('sms_number') or patient.get('phone')
+        if not to_number:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Patient has no phone number on file'}), 400
+
+        if not message:
+            message = (
+                f"Hi {patient.get('name', '').split(' ')[0] or 'there'}, this is your medical "
+                f"practice via OnCue Health. You are due for a {patient.get('procedure', 'screening')}. "
+                f"Reply YES to confirm interest in scheduling or STOP to opt out."
+            )
+
+        client = get_twilio()
+        msg = client.messages.create(
+            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+            to=to_number,
+            body=message,
+        )
+
+        log_conversation(
+            cur,
+            practice_id=patient.get('practice_id'),
+            patient_id=patient_id,
+            direction='outbound',
+            body=message,
+            twilio_sid=msg.sid,
+            status=msg.status,
+        )
+        cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('sms_sent', patient_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        log.info(f"Sent SMS to patient {patient_id} ({to_number}), Twilio SID {msg.sid}")
+        return jsonify({'success': True, 'twilio_sid': msg.sid, 'status': msg.status})
+
+    except Exception as e:
+        log.error(f"SMS send failed for patient {patient_id}: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Send bulk SMS ─────────────────────────────────────────────────────────────
+@app.route('/sms/send-bulk', methods=['POST'])
+def sms_send_bulk():
+    """
+    POST /sms/send-bulk
+    Body: JSON { patient_ids: [...], message } — 'message' overrides the default template
+    Sends the same recall message to multiple patients. Returns per-patient results
+    so partial failures don't block the whole batch.
+    """
+    data         = request.get_json()
+    patient_ids  = data.get('patient_ids', [])
+    message      = data.get('message')
+
+    if not patient_ids:
+        return jsonify({'error': 'patient_ids required'}), 400
+    if not TWILIO_MESSAGING_SERVICE_SID:
+        return jsonify({'error': 'TWILIO_MESSAGING_SERVICE_SID not configured'}), 500
+
+    client  = get_twilio()
+    results = []
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        for patient_id in patient_ids:
+            cur.execute("SELECT * FROM patients WHERE id = %s", (patient_id,))
+            patient = cur.fetchone()
+
+            if not patient:
+                results.append({'patient_id': patient_id, 'success': False, 'error': 'not found'})
+                continue
+
+            to_number = patient.get('sms_number') or patient.get('phone')
+            if not to_number:
+                results.append({'patient_id': patient_id, 'success': False, 'error': 'no phone on file'})
+                continue
+
+            body = message or (
+                f"Hi {patient.get('name', '').split(' ')[0] or 'there'}, this is your medical "
+                f"practice via OnCue Health. You are due for a {patient.get('procedure', 'screening')}. "
+                f"Reply YES to confirm interest in scheduling or STOP to opt out."
+            )
+
+            try:
+                msg = client.messages.create(
+                    messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+                    to=to_number,
+                    body=body,
+                )
+                log_conversation(
+                    cur,
+                    practice_id=patient.get('practice_id'),
+                    patient_id=patient_id,
+                    direction='outbound',
+                    body=body,
+                    twilio_sid=msg.sid,
+                    status=msg.status,
+                )
+                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('sms_sent', patient_id))
+                results.append({'patient_id': patient_id, 'success': True, 'twilio_sid': msg.sid})
+            except Exception as e:
+                log.warning(f"Bulk SMS failed for patient {patient_id}: {e}")
+                results.append({'patient_id': patient_id, 'success': False, 'error': str(e)})
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        sent = sum(1 for r in results if r['success'])
+        log.info(f"Bulk SMS: {sent}/{len(patient_ids)} sent successfully")
+        return jsonify({'success': True, 'sent': sent, 'total': len(patient_ids), 'results': results})
+
+    except Exception as e:
+        log.error(f"Bulk SMS send failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Inbound SMS webhook ────────────────────────────────────────────────────────
+@app.route('/sms/webhook', methods=['POST'])
+def sms_webhook():
+    """
+    POST /sms/webhook
+    Twilio inbound message webhook (application/x-www-form-urlencoded).
+    Configure this URL on the Messaging Service's inbound settings in the
+    Twilio Console: Messaging > Services > (your service) > Integration.
+
+    Validates the request signature, logs the reply, and updates patient
+    status for YES / STOP-type replies. Twilio itself already auto-handles
+    STOP/START/HELP at the carrier level per your campaign's opt-out keywords —
+    this handler is for your own app-level bookkeeping on top of that.
+    """
+    # Validate the request actually came from Twilio
+    if TWILIO_AUTH_TOKEN:
+        validator  = RequestValidator(TWILIO_AUTH_TOKEN)
+        signature  = request.headers.get('X-Twilio-Signature', '')
+        url        = request.url
+        is_valid   = validator.validate(url, request.form, signature)
+        if not is_valid:
+            log.warning("Invalid Twilio signature on inbound webhook")
+            return ('Invalid signature', 403)
+
+    from_number = request.form.get('From', '')
+    body        = (request.form.get('Body') or '').strip()
+    message_sid = request.form.get('MessageSid', '')
+
+    resp = MessagingResponse()
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute(
+            "SELECT * FROM patients WHERE sms_number = %s OR phone = %s ORDER BY recall_date DESC LIMIT 1",
+            (from_number, from_number),
+        )
+        patient = cur.fetchone()
+
+        patient_id  = patient['id'] if patient else None
+        practice_id = patient.get('practice_id') if patient else None
+
+        log_conversation(
+            cur,
+            practice_id=practice_id,
+            patient_id=patient_id,
+            direction='inbound',
+            body=body,
+            twilio_sid=message_sid,
+            status='received',
+        )
+
+        body_upper = body.upper()
+        if patient_id:
+            if body_upper in ('YES', 'Y', 'CONFIRM'):
+                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('confirmed', patient_id))
+            elif body_upper in ('STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'OPTOUT', 'REVOKE'):
+                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('opted_out', patient_id))
+            elif body_upper in ('NO', 'N'):
+                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('declined', patient_id))
+            else:
+                cur.execute("UPDATE patients SET status = %s WHERE id = %s", ('replied', patient_id))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        log.info(f"Inbound SMS from {from_number}: '{body}' (patient_id={patient_id})")
+
+    except Exception as e:
+        log.error(f"Inbound webhook processing failed: {e}", exc_info=True)
+        # Still return valid empty TwiML so Twilio doesn't retry endlessly
+
+    return str(resp), 200, {'Content-Type': 'text/xml'}
+
+
+# ── Get conversation history for a patient ───────────────────────────────────
+@app.route('/sms/conversations', methods=['GET'])
+def sms_conversations():
+    """
+    GET /sms/conversations?patient_id=xxx
+    Returns SMS conversation history for a patient, oldest first.
+    """
+    patient_id = request.args.get('patient_id')
+    if not patient_id:
+        return jsonify({'error': 'patient_id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT * FROM sms_conversations WHERE patient_id = %s ORDER BY created_at ASC",
+            (patient_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        log.error(f"Get conversations failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 # ── Parse PDF endpoint ──────────────────────────────────────────────────────
 @app.route('/parse', methods=['POST'])
