@@ -13,6 +13,7 @@ import psycopg2.extras
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -26,6 +27,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
 CORS(app, origins=['https://oncue.health', 'https://www.oncue.health', 'http://localhost:5173', 'http://localhost:3000'])
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -328,7 +330,7 @@ def sms_webhook():
         url        = request.url
         is_valid   = validator.validate(url, request.form, signature)
         if not is_valid:
-            log.warning("Invalid Twilio signature on inbound webhook")
+            log.warning(f"Invalid Twilio signature on inbound webhook. url={url} signature_present={bool(signature)}")
             return ('Invalid signature', 403)
 
     from_number = request.form.get('From', '')
