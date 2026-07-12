@@ -329,6 +329,183 @@ def delete_practice():
         return jsonify({'error': str(e)}), 500
 
 
+# ── Get profile by Firebase UID ─────────────────────────────────────────────
+@app.route('/profile', methods=['GET'])
+def get_profile():
+    """
+    GET /profile?firebase_uid=xxx
+    Returns profile + practice name for a given Firebase UID
+    """
+    firebase_uid = request.args.get('firebase_uid')
+    if not firebase_uid:
+        return jsonify({'error': 'firebase_uid required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT p.*, pr.name as practice_name
+            FROM profiles p
+            LEFT JOIN practices pr ON pr.id = p.practice_id
+            WHERE p.firebase_uid = %s
+            LIMIT 1
+        """, (firebase_uid,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return jsonify({'error': 'No profile found'}), 404
+
+        return jsonify(dict(row))
+
+    except Exception as e:
+        log.error(f"Get profile failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Get patients ─────────────────────────────────────────────────────────────
+@app.route('/patients', methods=['GET'])
+def get_patients():
+    """
+    GET /patients?practice_id=xxx&provider_id=xxx
+    Returns patients for a practice or provider
+    """
+    practice_id = request.args.get('practice_id')
+    provider_id = request.args.get('provider_id')
+
+    if not practice_id and not provider_id:
+        return jsonify({'error': 'practice_id or provider_id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        if practice_id:
+            cur.execute("SELECT * FROM patients WHERE practice_id = %s ORDER BY recall_date", (practice_id,))
+        else:
+            cur.execute("SELECT * FROM patients WHERE provider_id = %s ORDER BY recall_date", (provider_id,))
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        return jsonify([dict(r) for r in rows])
+
+    except Exception as e:
+        log.error(f"Get patients failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Get providers ─────────────────────────────────────────────────────────────
+@app.route('/providers', methods=['GET'])
+def get_providers():
+    """
+    GET /providers?practice_id=xxx
+    Returns providers for a practice
+    """
+    practice_id = request.args.get('practice_id')
+    if not practice_id:
+        return jsonify({'error': 'practice_id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, name FROM profiles WHERE practice_id = %s AND role = 'provider'", (practice_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        log.error(f"Get providers failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Update patient ─────────────────────────────────────────────────────────────
+@app.route('/patients/update', methods=['POST'])
+def update_patient():
+    """
+    POST /patients/update
+    Body: JSON { id, ...fields }
+    Updates a patient row
+    """
+    data = request.get_json()
+    patient_id = data.get('id')
+    if not patient_id:
+        return jsonify({'error': 'id required'}), 400
+
+    allowed = ['name','patient_no','dob','phone','phone_type','phone2','phone2_type',
+               'sms_number','sms_capable','procedure','recall_date','status',
+               'comments','flags','confidence','provider_id']
+
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if not updates:
+        return jsonify({'error': 'No valid fields to update'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        set_clause = ', '.join(f"{k} = %s" for k in updates)
+        values = list(updates.values()) + [patient_id]
+        cur.execute(f"UPDATE patients SET {set_clause} WHERE id = %s", values)
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        log.error(f"Update patient failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Add single patient ─────────────────────────────────────────────────────────
+@app.route('/patients/add', methods=['POST'])
+def add_patient():
+    """
+    POST /patients/add
+    Body: JSON { practice_id, provider_id, name, ... }
+    Adds a single patient
+    """
+    data = request.get_json()
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            INSERT INTO patients (
+                practice_id, provider_id, name, patient_no, dob,
+                phone, phone_type, phone2, phone2_type, sms_number,
+                sms_capable, procedure, recall_date, status,
+                comments, flags, confidence
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING *
+        """, (
+            data.get('practice_id'),
+            data.get('provider_id'),
+            data.get('name','').strip(),
+            data.get('patient_no') or None,
+            data.get('dob') or None,
+            data.get('phone',''),
+            data.get('phone_type','unknown'),
+            data.get('phone2') or None,
+            data.get('phone2_type') or None,
+            data.get('sms_number') or data.get('phone',''),
+            data.get('sms_capable'),
+            data.get('procedure','Colonoscopy'),
+            data.get('recall_date') or None,
+            data.get('status','ready'),
+            data.get('comments') or None,
+            data.get('flags',[]),
+            data.get('confidence','high'),
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(dict(row))
+    except Exception as e:
+        log.error(f"Add patient failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 # ── CSV parser helper ───────────────────────────────────────────────────────
 def parse_recall_csv(csv_path):
     """Parse a CSV recall export"""
