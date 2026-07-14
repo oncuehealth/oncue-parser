@@ -7,6 +7,7 @@ Migrated from Supabase to Google Cloud SQL (PostgreSQL) — July 2026
 import os
 import re
 import json
+import requests
 import tempfile
 import logging
 import psycopg2
@@ -799,12 +800,16 @@ def save_patients():
 
 
 # ── Create user endpoint ────────────────────────────────────────────────────
+FIREBASE_WEB_API_KEY = os.environ.get('FIREBASE_WEB_API_KEY', 'AIzaSyCBFy58BRY_ijv3niOcxdcOCghMoaFXwO8')
+
 @app.route('/create-user', methods=['POST'])
 def create_user():
     """
     POST /create-user
     Body: JSON { name, email, password, role, practice_id }
-    Creates a Firebase auth user + profile row in Cloud SQL
+    Creates a Firebase auth user (via the Identity Toolkit REST API using the
+    project's Web API key — no service-account key required) + a profile row
+    in Cloud SQL.
     """
     data        = request.get_json()
     name        = data.get('name', '').strip()
@@ -819,42 +824,40 @@ def create_user():
         return jsonify({'error': 'Invalid role'}), 400
 
     try:
-        # Create Firebase auth user
-        import firebase_admin
-        from firebase_admin import auth as firebase_auth, credentials
+        # Create the Firebase Auth user via the public Identity Toolkit REST API.
+        signup_url = f'https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_WEB_API_KEY}'
+        resp = requests.post(signup_url, json={
+            'email': email,
+            'password': password,
+            'displayName': name,
+            'returnSecureToken': True,
+        })
+        resp_data = resp.json()
 
-        # Initialize Firebase app if not already done
-        if not firebase_admin._apps:
-            service_account = json.loads(os.environ.get('FIREBASE_SERVICE_ACCOUNT', '{}'))
-            cred = credentials.Certificate(service_account)
-            firebase_admin.initialize_app(cred)
+        if resp.status_code != 200 or 'localId' not in resp_data:
+            err_msg = resp_data.get('error', {}).get('message', 'Unknown Firebase error')
+            log.error(f"Firebase signUp failed for {email}: {err_msg}")
+            return jsonify({'error': f'Firebase error: {err_msg}'}), 400
 
-        firebase_user = firebase_auth.create_user(
-            email=email,
-            password=password,
-            display_name=name,
-        )
-        user_id = firebase_user.uid
+        user_id = resp_data['localId']
         log.info(f"Created Firebase user {email} with uid {user_id}")
 
-        # Insert profile into Cloud SQL
+        # Insert profile into Cloud SQL — firebase_uid goes in its own column,
+        # id is left to auto-generate as a proper uuid.
         conn = get_db()
-        cur  = conn.cursor()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            INSERT INTO profiles (id, name, email, role, practice_id, active)
+            INSERT INTO profiles (firebase_uid, name, email, role, practice_id, active)
             VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (id) DO UPDATE SET
-                name = EXCLUDED.name,
-                role = EXCLUDED.role,
-                practice_id = EXCLUDED.practice_id,
-                active = EXCLUDED.active
+            RETURNING id
         """, (user_id, name, email, role, practice_id, True))
+        new_row = cur.fetchone()
         conn.commit()
         cur.close()
         conn.close()
 
-        log.info(f"Created profile for {email} ({role}) in practice {practice_id}")
-        return jsonify({'success': True, 'user_id': user_id, 'email': email})
+        log.info(f"Created profile {new_row['id']} for {email} ({role}) in practice {practice_id}")
+        return jsonify({'success': True, 'id': new_row['id'], 'user_id': user_id, 'email': email})
 
     except Exception as e:
         log.error(f"Create user failed: {e}")
