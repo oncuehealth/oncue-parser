@@ -209,7 +209,7 @@ def sms_send():
             status=msg.status,
         )
         cur.execute(
-            "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+            "UPDATE patients SET status = %s, conversation_state = %s, last_contacted_at = NOW() WHERE id = %s",
             ('sms_sent', 'awaiting_consent', patient_id),
         )
         conn.commit()
@@ -297,7 +297,7 @@ def sms_send_bulk():
                     status=msg.status,
                 )
                 cur.execute(
-                    "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                    "UPDATE patients SET status = %s, conversation_state = %s, last_contacted_at = NOW() WHERE id = %s",
                     ('sms_sent', 'awaiting_consent', patient_id),
                 )
                 results.append({'patient_id': patient_id, 'success': True, 'twilio_sid': msg.sid})
