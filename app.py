@@ -8,6 +8,9 @@ import os
 import re
 import json
 import requests
+from functools import wraps
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_auth_requests
 import tempfile
 import logging
 import psycopg2
@@ -86,6 +89,95 @@ def get_template_for_practice(cur, practice_id):
     return DEFAULT_TEMPLATE
 
 
+# ── Auth: verify Firebase ID tokens and enforce role-based scoping ──────────
+FIREBASE_PROJECT_ID = os.environ.get('FIREBASE_PROJECT_ID', 'oncue-health-26c99')
+_google_auth_request = google_auth_requests.Request()
+
+def verify_firebase_token(token):
+    """
+    Verifies a Firebase ID token against Google's public certs (no service
+    account needed) and returns the decoded claims, including the uid.
+    Raises an exception if the token is missing, expired, or invalid.
+    """
+    decoded = google_id_token.verify_firebase_token(token, _google_auth_request, audience=FIREBASE_PROJECT_ID)
+    return decoded
+
+
+def get_bearer_token():
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return None
+    return auth_header.split(' ', 1)[1]
+
+
+def require_auth(f):
+    """
+    Verifies the caller's Firebase ID token AND that they have an active
+    profile row in Cloud SQL. Attaches the profile to request.oncue_user
+    for the route to use for scoping (role, practice_id, id, etc).
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = get_bearer_token()
+        if not token:
+            return jsonify({'error': 'Missing Authorization header'}), 401
+        try:
+            decoded = verify_firebase_token(token)
+        except Exception as e:
+            log.warning(f"Token verification failed: {e}")
+            return jsonify({'error': 'Invalid or expired token'}), 401
+
+        firebase_uid = decoded.get('uid') or decoded.get('user_id') or decoded.get('sub')
+        try:
+            conn = get_db()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT id, name, email, role, practice_id, active FROM profiles WHERE firebase_uid = %s", (firebase_uid,))
+            profile = cur.fetchone()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            log.error(f"Profile lookup failed during auth: {e}")
+            return jsonify({'error': 'Auth check failed'}), 500
+
+        if not profile or not profile.get('active'):
+            return jsonify({'error': 'No active profile found for this account'}), 403
+
+        request.oncue_user = profile
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def require_role(*roles):
+    """Stack after @require_auth to additionally restrict by role."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            if request.oncue_user['role'] not in roles:
+                return jsonify({'error': 'Not authorized for this action'}), 403
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def patient_in_scope(cur, patient_id, user):
+    """
+    Checks whether the given patient belongs to the caller's scope:
+    superadmin -> any patient, admin -> same practice, provider -> assigned to them.
+    Returns the patient row (dict) if in scope, else None.
+    """
+    cur.execute("SELECT * FROM patients WHERE id = %s", (patient_id,))
+    patient = cur.fetchone()
+    if not patient:
+        return None
+    if user['role'] == 'superadmin':
+        return patient
+    if user['role'] == 'admin' and patient.get('practice_id') == user['practice_id']:
+        return patient
+    if user['role'] == 'provider' and patient.get('provider_id') == user['id']:
+        return patient
+    return None
+
+
 def render_template(template_text, patient_name=None, doctor_name=None, practice_name=None, procedure=None):
     # Provider names are often stored as "Dr. Jane Smith" already. Since templates
     # typically write "this is Dr. {doctor_name}", strip any leading "Dr."/"Dr" so
@@ -142,12 +234,14 @@ def health():
 
 # ── Send single SMS ──────────────────────────────────────────────────────────
 @app.route('/sms/send', methods=['POST'])
+@require_auth
 def sms_send():
     """
     POST /sms/send
     Body: JSON { patient_id, message } — 'message' overrides the default template
     Sends a recall SMS to one patient via the Twilio Messaging Service and
     logs the outbound message to sms_conversations.
+    Caller must have this patient in their scope.
     """
     data       = request.get_json()
     patient_id = data.get('patient_id')
@@ -174,6 +268,13 @@ def sms_send():
             cur.close()
             conn.close()
             return jsonify({'error': 'Patient not found'}), 404
+
+        u = request.oncue_user
+        in_scope = (u['role']=='superadmin') or (u['role']=='admin' and patient.get('practice_id')==u['practice_id']) or (u['role']=='provider' and patient.get('provider_id')==u['id'])
+        if not in_scope:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Not authorized for this patient'}), 403
 
         to_number = patient.get('sms_number') or patient.get('phone')
         if not to_number:
@@ -226,16 +327,19 @@ def sms_send():
 
 # ── Send bulk SMS ─────────────────────────────────────────────────────────────
 @app.route('/sms/send-bulk', methods=['POST'])
+@require_auth
 def sms_send_bulk():
     """
     POST /sms/send-bulk
     Body: JSON { patient_ids: [...], message } — 'message' overrides the default template
     Sends the same recall message to multiple patients. Returns per-patient results
-    so partial failures don't block the whole batch.
+    so partial failures don't block the whole batch. Any patient outside the
+    caller's scope is skipped with an authorization error rather than silently sent.
     """
     data         = request.get_json()
     patient_ids  = data.get('patient_ids', [])
     message      = data.get('message')
+    u            = request.oncue_user
 
     if not patient_ids:
         return jsonify({'error': 'patient_ids required'}), 400
@@ -261,6 +365,11 @@ def sms_send_bulk():
 
             if not patient:
                 results.append({'patient_id': patient_id, 'success': False, 'error': 'not found'})
+                continue
+
+            in_scope = (u['role']=='superadmin') or (u['role']=='admin' and patient.get('practice_id')==u['practice_id']) or (u['role']=='provider' and patient.get('provider_id')==u['id'])
+            if not in_scope:
+                results.append({'patient_id': patient_id, 'success': False, 'error': 'not authorized'})
                 continue
 
             to_number = patient.get('sms_number') or patient.get('phone')
@@ -476,15 +585,20 @@ def sms_webhook():
 
 # ── Message templates (per practice) ──────────────────────────────────────────
 @app.route('/practices', methods=['GET'])
+@require_auth
 def get_practices():
     """
-    GET /practices — list all practices with provider/patient counts
-    (used by the superadmin practice list and dropdowns/selectors elsewhere).
+    GET /practices — list practices with provider/patient counts.
+    Superadmin sees all; a practice admin sees only their own; providers can't list practices.
     """
+    u = request.oncue_user
+    if u['role'] == 'provider':
+        return jsonify({'error': 'Not authorized for this action'}), 403
+
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
+        base_sql = """
             SELECT
                 p.id, p.name, p.address, p.phone, p.specialty, p.created_at,
                 COUNT(DISTINCT pr.id) FILTER (WHERE pr.role = 'provider') AS provider_count,
@@ -492,9 +606,13 @@ def get_practices():
             FROM practices p
             LEFT JOIN profiles pr ON pr.practice_id = p.id
             LEFT JOIN patients pt ON pt.practice_id = p.id
-            GROUP BY p.id
-            ORDER BY p.name
-        """)
+        """
+        if u['role'] == 'admin':
+            base_sql += " WHERE p.id = %s GROUP BY p.id ORDER BY p.name"
+            cur.execute(base_sql, (u['practice_id'],))
+        else:
+            base_sql += " GROUP BY p.id ORDER BY p.name"
+            cur.execute(base_sql)
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -505,9 +623,11 @@ def get_practices():
 
 
 @app.route('/practices', methods=['POST'])
+@require_auth
+@require_role('superadmin')
 def create_practice():
     """
-    POST /practices
+    POST /practices — superadmin only.
     Body: JSON { name, address, phone, specialty }
     Creates a new practice.
     """
@@ -540,13 +660,19 @@ def create_practice():
 
 
 @app.route('/templates', methods=['GET'])
+@require_auth
 def get_template_route():
     """
     GET /templates?practice_id=xxx
-    Returns the practice's custom template if one exists, otherwise the default,
-    with is_default flagging which one it is.
+    Returns the practice's custom template if one exists, otherwise the default.
+    Admins may only view their own practice's template; superadmin may view any.
     """
+    u = request.oncue_user
+    if u['role'] == 'provider':
+        return jsonify({'error': 'Not authorized for this action'}), 403
     practice_id = request.args.get('practice_id')
+    if u['role'] == 'admin':
+        practice_id = u['practice_id']  # ignore any other practice_id requested
     if not practice_id:
         return jsonify({'error': 'practice_id required'}), 400
 
@@ -568,16 +694,25 @@ def get_template_route():
 
 
 @app.route('/templates', methods=['POST'])
+@require_auth
 def save_template_route():
     """
-    POST /templates
+    POST /templates — admin/superadmin only.
     Body: JSON { practice_id, template_text }
     Creates or updates a practice's custom opening message template.
+    Admins can only save their own practice's template.
     Supports placeholders: {patient_name} {doctor_name} {practice_name} {procedure}
     """
+    u = request.oncue_user
+    if u['role'] not in ('admin', 'superadmin'):
+        return jsonify({'error': 'Not authorized for this action'}), 403
+
     data          = request.get_json()
     practice_id   = data.get('practice_id')
     template_text = data.get('template_text')
+
+    if u['role'] == 'admin':
+        practice_id = u['practice_id']  # admins can only ever save their own
 
     if not practice_id or not template_text:
         return jsonify({'error': 'practice_id and template_text required'}), 400
@@ -606,10 +741,12 @@ def save_template_route():
 
 # ── Get conversation history for a patient ───────────────────────────────────
 @app.route('/sms/conversations', methods=['GET'])
+@require_auth
 def sms_conversations():
     """
     GET /sms/conversations?patient_id=xxx
     Returns SMS conversation history for a patient, oldest first.
+    Caller must have this patient in their scope (own practice/own patient).
     """
     patient_id = request.args.get('patient_id')
     if not patient_id:
@@ -618,6 +755,12 @@ def sms_conversations():
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        if not patient_in_scope(cur, patient_id, request.oncue_user):
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Not authorized for this patient'}), 403
+
         cur.execute(
             "SELECT * FROM sms_conversations WHERE patient_id = %s ORDER BY created_at ASC",
             (patient_id,),
@@ -633,14 +776,17 @@ def sms_conversations():
 
 # ── Parse PDF endpoint ──────────────────────────────────────────────────────
 @app.route('/parse', methods=['POST'])
+@require_auth
+@require_role('admin', 'superadmin')
 def parse():
     """
-    POST /parse
+    POST /parse — admin/superadmin only.
     Body: multipart/form-data with 'file' (PDF or CSV)
            + 'practice_id' (UUID)
            + 'provider_id' (UUID)
            + 'lookup_phones' (bool, default true)
     Returns: JSON with parsed patients and stats
+    Admins may only parse into their own practice.
     """
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
@@ -652,6 +798,9 @@ def parse():
     practice_id  = request.form.get('practice_id')
     provider_id  = request.form.get('provider_id')
     do_lookup    = request.form.get('lookup_phones', 'true').lower() == 'true'
+
+    if request.oncue_user['role'] == 'admin':
+        practice_id = request.oncue_user['practice_id']
 
     # Check file size
     file.seek(0, 2)
@@ -730,16 +879,21 @@ def parse():
 
 # ── Save patients endpoint ───────────────────────────────────────────────────
 @app.route('/save', methods=['POST'])
+@require_auth
+@require_role('admin', 'superadmin')
 def save_patients():
     """
-    POST /save
+    POST /save — admin/superadmin only.
     Body: JSON { patients: [...], practice_id, provider_id }
-    Saves parsed patients to Cloud SQL
+    Saves parsed patients to Cloud SQL. Admins may only save into their own practice.
     """
     data        = request.get_json()
     patients    = data.get('patients', [])
     practice_id = data.get('practice_id')
     provider_id = data.get('provider_id')
+
+    if request.oncue_user['role'] == 'admin':
+        practice_id = request.oncue_user['practice_id']
 
     if not patients:
         return jsonify({'error': 'No patients provided'}), 400
@@ -803,20 +957,30 @@ def save_patients():
 FIREBASE_WEB_API_KEY = os.environ.get('FIREBASE_WEB_API_KEY', 'AIzaSyCBFy58BRY_ijv3niOcxdcOCghMoaFXwO8')
 
 @app.route('/create-user', methods=['POST'])
+@require_auth
+@require_role('admin', 'superadmin')
 def create_user():
     """
-    POST /create-user
+    POST /create-user — admin/superadmin only.
     Body: JSON { name, email, password, role, practice_id }
     Creates a Firebase auth user (via the Identity Toolkit REST API using the
     project's Web API key — no service-account key required) + a profile row
     in Cloud SQL.
+    Admins may only create providers/admins within their own practice — never
+    a superadmin, and never in a different practice.
     """
+    u = request.oncue_user
     data        = request.get_json()
     name        = data.get('name', '').strip()
     email       = data.get('email', '').strip()
     password    = data.get('password', '')
     role        = data.get('role', 'provider')
     practice_id = data.get('practice_id')
+
+    if u['role'] == 'admin':
+        practice_id = u['practice_id']  # can't create in another practice
+        if role == 'superadmin':
+            return jsonify({'error': 'Not authorized to create a superadmin'}), 403
 
     if not name or not email or not password:
         return jsonify({'error': 'name, email, and password are required'}), 400
@@ -866,9 +1030,11 @@ def create_user():
 
 # ── Delete practice endpoint ────────────────────────────────────────────────
 @app.route('/delete-practice', methods=['POST'])
+@require_auth
+@require_role('superadmin')
 def delete_practice():
     """
-    POST /delete-practice
+    POST /delete-practice — superadmin only.
     Body: JSON { practice_id }
     Deletes a practice and its profiles (only if no patients exist)
     """
@@ -911,12 +1077,23 @@ def delete_practice():
 @app.route('/profile', methods=['GET'])
 def get_profile():
     """
-    GET /profile?firebase_uid=xxx
-    Returns profile + practice name for a given Firebase UID
+    GET /profile
+    Returns the caller's own profile + practice name.
+    Verifies the caller's Firebase ID token and uses the UID FROM THE TOKEN —
+    never trusts a firebase_uid passed as a query param, since that would let
+    anyone fetch anyone else's profile (including role/practice_id) with no
+    authentication at all.
     """
-    firebase_uid = request.args.get('firebase_uid')
-    if not firebase_uid:
-        return jsonify({'error': 'firebase_uid required'}), 400
+    token = get_bearer_token()
+    if not token:
+        return jsonify({'error': 'Missing Authorization header'}), 401
+    try:
+        decoded = verify_firebase_token(token)
+    except Exception as e:
+        log.warning(f"Token verification failed on /profile: {e}")
+        return jsonify({'error': 'Invalid or expired token'}), 401
+
+    firebase_uid = decoded.get('uid') or decoded.get('user_id') or decoded.get('sub')
 
     try:
         conn = get_db()
@@ -944,15 +1121,26 @@ def get_profile():
 
 # ── Get patients ─────────────────────────────────────────────────────────────
 @app.route('/patients', methods=['GET'])
+@require_auth
 def get_patients():
     """
-    GET /patients?practice_id=xxx        → patients for one practice
-    GET /patients?provider_id=xxx        → patients for one provider
-    GET /patients?all=true               → every patient across every practice (superadmin use)
+    GET /patients?practice_id=xxx        → patients for one practice (admin, own practice only)
+    GET /patients?provider_id=xxx        → patients for one provider (provider, self only)
+    GET /patients?all=true               → every patient across every practice (superadmin only)
+    Query params are overridden/ignored where they'd let a caller see beyond their own scope.
     """
+    u = request.oncue_user
     practice_id = request.args.get('practice_id')
     provider_id = request.args.get('provider_id')
     all_flag    = request.args.get('all') == 'true'
+
+    # Force scope based on the caller's actual role — never trust the client's query params
+    if u['role'] == 'superadmin':
+        pass  # all_flag / practice_id / provider_id as requested are fine
+    elif u['role'] == 'admin':
+        practice_id, provider_id, all_flag = u['practice_id'], None, False
+    else:  # provider
+        practice_id, provider_id, all_flag = None, u['id'], False
 
     if not practice_id and not provider_id and not all_flag:
         return jsonify({'error': 'practice_id, provider_id, or all=true required'}), 400
@@ -981,15 +1169,24 @@ def get_patients():
 
 # ── Get providers ─────────────────────────────────────────────────────────────
 @app.route('/providers', methods=['GET'])
+@require_auth
 def get_providers():
     """
-    GET /providers?practice_id=xxx   → providers for one practice
-    GET /providers?all=true          → every provider across every practice (superadmin use)
+    GET /providers?practice_id=xxx   → providers for one practice (admin, own practice only)
+    GET /providers?all=true          → every provider across every practice (superadmin only)
     Returns id, name, email, role, active, practice_id, practice_name.
     """
+    u = request.oncue_user
     practice_id = request.args.get('practice_id')
     all_flag    = request.args.get('all') == 'true'
     role_filter = request.args.get('role', 'provider')  # 'provider' (default), 'all', or a specific role
+
+    if u['role'] == 'superadmin':
+        pass
+    elif u['role'] == 'admin':
+        practice_id, all_flag = u['practice_id'], False
+    else:  # plain providers don't need to browse the roster
+        return jsonify({'error': 'Not authorized for this action'}), 403
 
     if not practice_id and not all_flag:
         return jsonify({'error': 'practice_id or all=true required'}), 400
@@ -1025,11 +1222,13 @@ def get_providers():
 
 # ── Update patient ─────────────────────────────────────────────────────────────
 @app.route('/patients/update', methods=['POST'])
+@require_auth
 def update_patient():
     """
     POST /patients/update
     Body: JSON { id, ...fields }
-    Updates a patient row
+    Updates a patient row. Caller must have this patient in their scope
+    (own practice for admins, own assigned patients for providers).
     """
     data = request.get_json()
     patient_id = data.get('id')
@@ -1046,7 +1245,13 @@ def update_patient():
 
     try:
         conn = get_db()
-        cur  = conn.cursor()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        if not patient_in_scope(cur, patient_id, request.oncue_user):
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Not authorized for this patient'}), 403
+
         set_clause = ', '.join(f"{k} = %s" for k in updates)
         values = list(updates.values()) + [patient_id]
         cur.execute(f"UPDATE patients SET {set_clause} WHERE id = %s", values)
@@ -1061,13 +1266,18 @@ def update_patient():
 
 # ── Add single patient ─────────────────────────────────────────────────────────
 @app.route('/patients/add', methods=['POST'])
+@require_auth
+@require_role('admin', 'superadmin')
 def add_patient():
     """
-    POST /patients/add
+    POST /patients/add — admin/superadmin only.
     Body: JSON { practice_id, provider_id, name, ... }
-    Adds a single patient
+    Adds a single patient. Admins may only add into their own practice.
     """
     data = request.get_json()
+    practice_id = data.get('practice_id')
+    if request.oncue_user['role'] == 'admin':
+        practice_id = request.oncue_user['practice_id']
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1080,7 +1290,7 @@ def add_patient():
             ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING *
         """, (
-            data.get('practice_id'),
+            practice_id,
             data.get('provider_id'),
             data.get('name','').strip(),
             data.get('patient_no') or None,
