@@ -76,7 +76,9 @@ def log_conversation(cur, practice_id, patient_id, direction, body, twilio_sid=N
 DEFAULT_TEMPLATE = (
     "Hi {patient_name}, this is Dr. {doctor_name} from {practice_name}. We see that you are "
     "due for your {procedure}. We would love to help you get it scheduled in an expedited and "
-    "efficient manner. Are you able to answer some questions so that we can get it scheduled?"
+    "efficient manner. Are you able to answer some questions so that we can get it scheduled? "
+    "If you would like a call instead of using our automated HIPAA-compliant text platform, "
+    "please text CALL."
 )
 
 def get_template_for_practice(cur, practice_id):
