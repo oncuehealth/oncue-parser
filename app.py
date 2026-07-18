@@ -583,6 +583,68 @@ def sms_webhook():
     return str(resp), 200, {'Content-Type': 'text/xml'}
 
 
+# ── Delivery status callback ─────────────────────────────────────────────────
+@app.route('/sms/status-callback', methods=['POST'])
+def sms_status_callback():
+    """
+    POST /sms/status-callback
+    Twilio calls this for every status change on a message it sent on our behalf
+    (queued -> sent -> delivered, or -> failed/undelivered). Configure this URL
+    as the Messaging Service's "Delivery Status Callback" in the Twilio Console
+    (separate field from the inbound "Incoming Messages" webhook).
+
+    Updates the matching sms_conversations row's status, and — for failed or
+    undelivered messages — flags the patient record so staff can see the send
+    didn't actually reach them (a "sent" message that silently never arrives
+    would otherwise look identical to one that did).
+    """
+    if TWILIO_AUTH_TOKEN:
+        validator = RequestValidator(TWILIO_AUTH_TOKEN)
+        signature = request.headers.get('X-Twilio-Signature', '')
+        if not validator.validate(request.url, request.form, signature):
+            log.warning("Invalid Twilio signature on status callback")
+            return ('Invalid signature', 403)
+
+    message_sid   = request.form.get('MessageSid', '')
+    message_status = request.form.get('MessageStatus', '')  # queued, sent, delivered, undelivered, failed
+    error_code    = request.form.get('ErrorCode')
+    error_message = request.form.get('ErrorMessage')
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute("UPDATE sms_conversations SET status = %s WHERE twilio_sid = %s", (message_status, message_sid))
+
+        if message_status in ('failed', 'undelivered'):
+            cur.execute("SELECT patient_id FROM sms_conversations WHERE twilio_sid = %s LIMIT 1", (message_sid,))
+            row = cur.fetchone()
+            if row and row.get('patient_id'):
+                error_detail = f"{error_code}: {error_message}" if error_code else message_status
+                cur.execute(
+                    "UPDATE patients SET last_delivery_status = %s, last_delivery_error = %s WHERE id = %s",
+                    (message_status, error_detail, row['patient_id']),
+                )
+                log.warning(f"SMS delivery failed for patient {row['patient_id']}: {error_detail}")
+        elif message_status == 'delivered':
+            cur.execute("SELECT patient_id FROM sms_conversations WHERE twilio_sid = %s LIMIT 1", (message_sid,))
+            row = cur.fetchone()
+            if row and row.get('patient_id'):
+                cur.execute(
+                    "UPDATE patients SET last_delivery_status = %s, last_delivery_error = NULL WHERE id = %s",
+                    (message_status, row['patient_id']),
+                )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        log.error(f"Status callback processing failed: {e}", exc_info=True)
+
+    return ('', 204)
+
+
 # ── Message templates (per practice) ──────────────────────────────────────────
 @app.route('/practices', methods=['GET'])
 @require_auth
