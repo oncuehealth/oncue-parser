@@ -723,6 +723,53 @@ def create_practice():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/practices/update', methods=['POST'])
+@require_auth
+@require_role('admin', 'superadmin')
+def update_practice():
+    """
+    POST /practices/update — admin/superadmin only.
+    Body: JSON { id, name, address, phone, specialty }
+    Admins may only update their own practice.
+    """
+    u    = request.oncue_user
+    data = request.get_json()
+    practice_id = data.get('id')
+
+    if u['role'] == 'admin':
+        practice_id = u['practice_id']  # can only ever update their own
+
+    if not practice_id:
+        return jsonify({'error': 'id required'}), 400
+
+    name      = (data.get('name') or '').strip()
+    address   = data.get('address') or None
+    phone     = data.get('phone') or None
+    specialty = data.get('specialty') or None
+
+    if not name:
+        return jsonify({'error': 'name required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            UPDATE practices SET name = %s, address = %s, phone = %s, specialty = %s
+            WHERE id = %s
+            RETURNING *
+        """, (name, address, phone, specialty, practice_id))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({'error': 'Practice not found'}), 404
+        return jsonify(dict(row))
+    except Exception as e:
+        log.error(f"Update practice failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/templates', methods=['GET'])
 @require_auth
 def get_template_route():
@@ -1180,6 +1227,32 @@ def get_profile():
 
     except Exception as e:
         log.error(f"Get profile failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/profile/update', methods=['POST'])
+@require_auth
+def update_profile():
+    """
+    POST /profile/update — any authenticated user, own profile only.
+    Body: JSON { name }
+    """
+    data = request.get_json()
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("UPDATE profiles SET name = %s WHERE id = %s RETURNING *", (name, request.oncue_user['id']))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(dict(row))
+    except Exception as e:
+        log.error(f"Update profile failed: {e}")
         return jsonify({'error': str(e)}), 500
 
 
