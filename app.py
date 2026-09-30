@@ -161,6 +161,30 @@ def require_role(*roles):
     return decorator
 
 
+def normalize_phone(raw):
+    """
+    Normalize a phone number to E.164 (+1XXXXXXXXXX) for US/Canada numbers.
+    Handles plain digits, dashes, parens, spaces, and an existing leading 1 or +1.
+    Twilio's inbound webhook always sends numbers in E.164 (e.g. "+19376847192"),
+    so any number stored in a different format will silently fail to match an
+    inbound reply to the right patient — this must run before any phone value
+    is saved to the database.
+    Returns the original string unchanged if it can't be confidently normalized
+    (e.g. clearly international, or too few/many digits).
+    """
+    if not raw:
+        return raw
+    raw = raw.strip()
+    if raw.startswith('+'):
+        return raw  # already E.164 (or at least already prefixed) — leave as-is
+    digits = re.sub(r'\D', '', raw)
+    if len(digits) == 10:
+        return f'+1{digits}'
+    if len(digits) == 11 and digits[0] == '1':
+        return f'+{digits}'
+    return raw
+
+
 def patient_in_scope(cur, patient_id, user):
     """
     Checks whether the given patient belongs to the caller's scope:
@@ -1380,6 +1404,11 @@ def update_patient():
     if not updates:
         return jsonify({'error': 'No valid fields to update'}), 400
 
+    # Normalize any phone fields being updated so inbound SMS replies keep matching.
+    for field in ('phone', 'phone2', 'sms_number'):
+        if field in updates and updates[field]:
+            updates[field] = normalize_phone(updates[field])
+
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1404,17 +1433,36 @@ def update_patient():
 # ── Add single patient ─────────────────────────────────────────────────────────
 @app.route('/patients/add', methods=['POST'])
 @require_auth
-@require_role('admin', 'superadmin')
+@require_role('admin', 'superadmin', 'provider')
 def add_patient():
     """
-    POST /patients/add — admin/superadmin only.
+    POST /patients/add — admin, superadmin, or provider.
     Body: JSON { practice_id, provider_id, name, ... }
-    Adds a single patient. Admins may only add into their own practice.
+    Adds a single patient.
+    - Admins may only add into their own practice (any provider within it).
+    - Providers may only add into their own practice, assigned to themselves —
+      practice_id and provider_id are always forced to their own, regardless
+      of what's sent, so a provider can never create a patient under someone
+      else's name or in another practice.
+    - Superadmin may specify any practice_id/provider_id.
+    Phone numbers are normalized to E.164 before saving so inbound SMS replies
+    can be matched back to this patient.
     """
+    u = request.oncue_user
     data = request.get_json()
     practice_id = data.get('practice_id')
-    if request.oncue_user['role'] == 'admin':
-        practice_id = request.oncue_user['practice_id']
+    provider_id = data.get('provider_id')
+
+    if u['role'] == 'admin':
+        practice_id = u['practice_id']
+    elif u['role'] == 'provider':
+        practice_id = u['practice_id']
+        provider_id = u['id']
+
+    phone  = normalize_phone(data.get('phone', ''))
+    phone2 = normalize_phone(data.get('phone2')) if data.get('phone2') else None
+    sms_number = normalize_phone(data.get('sms_number')) if data.get('sms_number') else phone
+
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1428,15 +1476,15 @@ def add_patient():
             RETURNING *
         """, (
             practice_id,
-            data.get('provider_id'),
+            provider_id,
             data.get('name','').strip(),
             data.get('patient_no') or None,
             data.get('dob') or None,
-            data.get('phone',''),
+            phone,
             data.get('phone_type','unknown'),
-            data.get('phone2') or None,
+            phone2,
             data.get('phone2_type') or None,
-            data.get('sms_number') or data.get('phone',''),
+            sms_number,
             data.get('sms_capable'),
             data.get('procedure','Colonoscopy'),
             data.get('recall_date') or None,
