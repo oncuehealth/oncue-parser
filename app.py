@@ -912,16 +912,17 @@ def sms_conversations():
 # ── Parse PDF endpoint ──────────────────────────────────────────────────────
 @app.route('/parse', methods=['POST'])
 @require_auth
-@require_role('admin', 'superadmin')
+@require_role('admin', 'superadmin', 'provider')
 def parse():
     """
-    POST /parse — admin/superadmin only.
+    POST /parse — admin, superadmin, or provider.
     Body: multipart/form-data with 'file' (PDF or CSV)
            + 'practice_id' (UUID)
            + 'provider_id' (UUID)
            + 'lookup_phones' (bool, default true)
     Returns: JSON with parsed patients and stats
     Admins may only parse into their own practice.
+    Providers may only parse into their own practice, assigned to themselves.
     """
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
@@ -936,6 +937,9 @@ def parse():
 
     if request.oncue_user['role'] == 'admin':
         practice_id = request.oncue_user['practice_id']
+    elif request.oncue_user['role'] == 'provider':
+        practice_id = request.oncue_user['practice_id']
+        provider_id = request.oncue_user['id']
 
     # Check file size
     file.seek(0, 2)
@@ -1015,12 +1019,17 @@ def parse():
 # ── Save patients endpoint ───────────────────────────────────────────────────
 @app.route('/save', methods=['POST'])
 @require_auth
-@require_role('admin', 'superadmin')
+@require_role('admin', 'superadmin', 'provider')
 def save_patients():
     """
-    POST /save — admin/superadmin only.
+    POST /save — admin, superadmin, or provider.
     Body: JSON { patients: [...], practice_id, provider_id }
-    Saves parsed patients to Cloud SQL. Admins may only save into their own practice.
+    Saves parsed patients to Cloud SQL.
+    Admins may only save into their own practice.
+    Providers may only save into their own practice, assigned to themselves.
+    Phone numbers are normalized to E.164 before saving — the PDF/CSV parser
+    outputs numbers like "781-321-1972", which won't match Twilio's E.164
+    "From" field on inbound replies unless normalized here first.
     """
     data        = request.get_json()
     patients    = data.get('patients', [])
@@ -1029,6 +1038,9 @@ def save_patients():
 
     if request.oncue_user['role'] == 'admin':
         practice_id = request.oncue_user['practice_id']
+    elif request.oncue_user['role'] == 'provider':
+        practice_id = request.oncue_user['practice_id']
+        provider_id = request.oncue_user['id']
 
     if not patients:
         return jsonify({'error': 'No patients provided'}), 400
@@ -1053,17 +1065,20 @@ def save_patients():
 
         rows = []
         for p in patients:
+            raw_primary = p.get('sms_number') or p.get('phone', '')
+            primary     = normalize_phone(raw_primary)
+            phone2      = normalize_phone(p.get('phone2')) if p.get('phone2') else None
             rows.append((
                 practice_id or p.get('practice_id'),
                 provider_id or p.get('provider_id'),
                 p.get('name', '').strip(),
                 p.get('patient_no', '').strip() or None,
                 p.get('dob') or None,
-                p.get('sms_number') or p.get('phone', ''),
+                primary,
                 p.get('sms_number_type') or p.get('phone_type', 'unknown'),
-                p.get('phone2') or None,
+                phone2,
                 p.get('phone2_type') or None,
-                p.get('sms_number') or p.get('phone', ''),
+                primary,
                 p.get('sms_capable'),
                 p.get('procedure', 'Colonoscopy'),
                 p.get('recall_date') or None,
