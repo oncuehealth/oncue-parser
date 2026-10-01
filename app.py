@@ -1424,6 +1424,13 @@ def update_patient():
         if field in updates and updates[field]:
             updates[field] = normalize_phone(updates[field])
 
+    # SMS sends use sms_number first, falling back to phone — so if the caller
+    # edited 'phone' but didn't separately specify 'sms_number', keep them in
+    # sync. Otherwise an edited phone silently has no effect on what number
+    # actually gets texted, since the old sms_number keeps winning.
+    if 'phone' in updates and 'sms_number' not in updates:
+        updates['sms_number'] = updates['phone']
+
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -1442,6 +1449,43 @@ def update_patient():
         return jsonify({'success': True})
     except Exception as e:
         log.error(f"Update patient failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Delete a patient ─────────────────────────────────────────────────────────
+@app.route('/patients/delete', methods=['POST'])
+@require_auth
+def delete_patient():
+    """
+    POST /patients/delete
+    Body: JSON { id }
+    Permanently removes a patient record. Caller must have this patient in
+    their scope (own practice for admins, own assigned patients for providers).
+    Also removes any sms_conversations rows for this patient first, since
+    those reference patient_id and would otherwise block the delete.
+    """
+    data = request.get_json()
+    patient_id = data.get('id')
+    if not patient_id:
+        return jsonify({'error': 'id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        if not patient_in_scope(cur, patient_id, request.oncue_user):
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Not authorized for this patient'}), 403
+
+        cur.execute("DELETE FROM sms_conversations WHERE patient_id = %s", (patient_id,))
+        cur.execute("DELETE FROM patients WHERE id = %s", (patient_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        log.error(f"Delete patient failed: {e}")
         return jsonify({'error': str(e)}), 500
 
 
