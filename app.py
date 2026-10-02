@@ -1047,7 +1047,18 @@ def save_patients():
 
     try:
         conn = get_db()
-        cur  = conn.cursor()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Pre-load phone numbers already on file for this practice so we can
+        # skip re-adding the same patient (common when re-uploading a recall
+        # list, or when the same person appears twice in one PDF).
+        existing_phones = set()
+        scope_practice = practice_id or (patients[0].get('practice_id') if patients else None)
+        if scope_practice:
+            cur.execute("SELECT phone, sms_number FROM patients WHERE practice_id = %s", (scope_practice,))
+            for r in cur.fetchall():
+                if r['phone']: existing_phones.add(r['phone'])
+                if r['sms_number']: existing_phones.add(r['sms_number'])
 
         insert_sql = """
             INSERT INTO patients (
@@ -1064,10 +1075,18 @@ def save_patients():
         """
 
         rows = []
+        skipped_duplicates = []
         for p in patients:
             raw_primary = p.get('sms_number') or p.get('phone', '')
             primary     = normalize_phone(raw_primary)
             phone2      = normalize_phone(p.get('phone2')) if p.get('phone2') else None
+
+            if primary and primary in existing_phones:
+                skipped_duplicates.append({'name': p.get('name', '').strip(), 'phone': primary})
+                continue
+            if primary:
+                existing_phones.add(primary)  # catch duplicates within this same batch too
+
             rows.append((
                 practice_id or p.get('practice_id'),
                 provider_id or p.get('provider_id'),
@@ -1088,15 +1107,16 @@ def save_patients():
                 p.get('confidence', 'high'),
             ))
 
-        cur.executemany(insert_sql, rows)
+        if rows:
+            cur.executemany(insert_sql, rows)
         conn.commit()
-        saved = cur.rowcount if cur.rowcount > 0 else len(rows)
+        saved = len(rows)
 
         cur.close()
         conn.close()
 
-        log.info(f"Saved {saved} patients to Cloud SQL")
-        return jsonify({'success': True, 'saved': saved})
+        log.info(f"Saved {saved} patients to Cloud SQL ({len(skipped_duplicates)} duplicates skipped)")
+        return jsonify({'success': True, 'saved': saved, 'skipped_duplicates': skipped_duplicates})
 
     except Exception as e:
         log.error(f"Cloud SQL save failed: {e}")
@@ -1343,6 +1363,61 @@ def get_patients():
         return jsonify({'error': str(e)}), 500
 
 
+# ── Message-count analytics ──────────────────────────────────────────────────
+@app.route('/analytics/messages', methods=['GET'])
+@require_auth
+def analytics_messages():
+    """
+    GET /analytics/messages?practice_id=xxx | ?provider_id=xxx | ?all=true
+    Returns total outbound/inbound message counts (every individual text,
+    not just unique patients) for the given scope. Same role-based scoping
+    as /patients — query params are overridden where they'd exceed the
+    caller's own access.
+    """
+    u = request.oncue_user
+    practice_id = request.args.get('practice_id')
+    provider_id = request.args.get('provider_id')
+    all_flag    = request.args.get('all') == 'true'
+
+    if u['role'] == 'superadmin':
+        pass
+    elif u['role'] == 'admin':
+        practice_id, provider_id, all_flag = u['practice_id'], None, False
+    else:
+        practice_id, provider_id, all_flag = None, u['id'], False
+
+    if not practice_id and not provider_id and not all_flag:
+        return jsonify({'error': 'practice_id, provider_id, or all=true required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        base = """
+            SELECT
+                COUNT(*) FILTER (WHERE sc.direction = 'outbound') AS messages_sent,
+                COUNT(*) FILTER (WHERE sc.direction = 'inbound')  AS messages_received
+            FROM sms_conversations sc
+        """
+        if all_flag:
+            cur.execute(base)
+        elif practice_id:
+            cur.execute(base + " WHERE sc.practice_id = %s", (practice_id,))
+        else:
+            cur.execute(base + " JOIN patients p ON p.id = sc.patient_id WHERE p.provider_id = %s", (provider_id,))
+
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return jsonify({
+            'messages_sent': row['messages_sent'] or 0,
+            'messages_received': row['messages_received'] or 0,
+        })
+    except Exception as e:
+        log.error(f"Analytics messages failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 # ── Get providers ─────────────────────────────────────────────────────────────
 @app.route('/providers', methods=['GET'])
 @require_auth
@@ -1521,10 +1596,27 @@ def add_patient():
     phone  = normalize_phone(data.get('phone', ''))
     phone2 = normalize_phone(data.get('phone2')) if data.get('phone2') else None
     sms_number = normalize_phone(data.get('sms_number')) if data.get('sms_number') else phone
+    confirm_duplicate = bool(data.get('confirm_duplicate'))
 
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        if phone and not confirm_duplicate:
+            cur.execute(
+                "SELECT id, name, phone FROM patients WHERE practice_id = %s AND (phone = %s OR sms_number = %s) LIMIT 1",
+                (practice_id, phone, phone),
+            )
+            existing = cur.fetchone()
+            if existing:
+                cur.close()
+                conn.close()
+                return jsonify({
+                    'duplicate': True,
+                    'existing': dict(existing),
+                    'error': f"A patient with this phone number already exists: {existing['name']}",
+                }), 409
+
         cur.execute("""
             INSERT INTO patients (
                 practice_id, provider_id, name, patient_no, dob,
