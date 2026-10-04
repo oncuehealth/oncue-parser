@@ -308,6 +308,41 @@ QUESTION_STATES  = [q[0] for q in QUESTION_FLOW]
 QUESTION_TEXT    = {q[0]: q[1] for q in QUESTION_FLOW}
 QUESTION_COLUMN  = {q[0]: q[2] for q in QUESTION_FLOW}
 
+
+def default_intake_questions():
+    """The built-in question set/order/wording, as a JSON-able list."""
+    return [{'key': k, 'prompt': QUESTION_TEXT[k], 'enabled': True} for k in QUESTION_STATES]
+
+
+def get_intake_questions(cur, practice_id):
+    """
+    Returns a practice's effective intake question list — enabled ones only,
+    in their configured order, each as {'key','prompt','column'}. The 7
+    underlying keys/columns are fixed (they map to real patient columns),
+    but a practice can disable any of them, reorder the rest, and reword
+    each prompt. A practice that's never customized this (intake_questions
+    is NULL) gets the original built-in order/wording, so nothing changes
+    for any existing practice unless they explicitly edit it in Settings.
+    Unknown/stale keys in a saved config are defensively ignored, in case
+    the underlying question set ever changes later.
+    """
+    cur.execute("SELECT intake_questions FROM practices WHERE id = %s", (practice_id,))
+    row = cur.fetchone()
+    custom = row['intake_questions'] if row else None
+    source = custom if custom else default_intake_questions()
+
+    result = []
+    for item in source:
+        key = item.get('key')
+        if key not in QUESTION_COLUMN or not item.get('enabled', True):
+            continue
+        result.append({
+            'key': key,
+            'prompt': item.get('prompt') or QUESTION_TEXT[key],
+            'column': QUESTION_COLUMN[key],
+        })
+    return result
+
 CALL_REQUEST_KEYWORDS = ('CALL', 'PHONE', 'SPEAK', 'TALK')
 YES_KEYWORDS          = ('YES', 'Y', 'SURE', 'OK', 'OKAY')
 NO_KEYWORDS           = ('NO', 'N')
@@ -570,12 +605,23 @@ def sms_webhook():
 
             elif state in ('not_started', 'awaiting_consent'):
                 if body_upper in YES_KEYWORDS:
-                    first_q_state = QUESTION_STATES[0]
-                    cur.execute(
-                        "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
-                        ('answering_questions', first_q_state, patient_id),
-                    )
-                    reply_text = QUESTION_TEXT[first_q_state]
+                    questions = get_intake_questions(cur, patient.get('practice_id'))
+                    if questions:
+                        first_q = questions[0]
+                        cur.execute(
+                            "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                            ('answering_questions', first_q['key'], patient_id),
+                        )
+                        reply_text = first_q['prompt']
+                    else:
+                        # Practice has disabled every intake question — nothing to ask, go straight to done.
+                        cur.execute(
+                            "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                            ('ready_to_schedule', 'complete', patient_id),
+                        )
+                        reply_text = (
+                            "Thank you! Our scheduling team will follow up shortly to confirm your appointment."
+                        )
                 elif body_upper in NO_KEYWORDS:
                     cur.execute(
                         "UPDATE patients SET conversation_state = %s WHERE id = %s",
@@ -606,16 +652,34 @@ def sms_webhook():
                     reply_text = "No problem, thank you for letting us know."
 
             elif state in QUESTION_STATES:
-                # Save the answer to this question's column
+                # Save the answer to this question's column (column mapping is
+                # fixed regardless of practice customization — only the
+                # order/wording/enabled-ness is configurable).
                 column = QUESTION_COLUMN[state]
                 cur.execute(f"UPDATE patients SET {column} = %s WHERE id = %s", (body, patient_id))
 
-                idx = QUESTION_STATES.index(state)
-                if idx + 1 < len(QUESTION_STATES):
-                    next_state = QUESTION_STATES[idx + 1]
-                    cur.execute("UPDATE patients SET conversation_state = %s WHERE id = %s", (next_state, patient_id))
-                    reply_text = QUESTION_TEXT[next_state]
+                questions = get_intake_questions(cur, patient.get('practice_id'))
+                keys_in_order = [q['key'] for q in questions]
+
+                if state in keys_in_order:
+                    idx = keys_in_order.index(state)
+                    if idx + 1 < len(keys_in_order):
+                        next_q = questions[idx + 1]
+                        cur.execute("UPDATE patients SET conversation_state = %s WHERE id = %s", (next_q['key'], patient_id))
+                        reply_text = next_q['prompt']
+                    else:
+                        cur.execute(
+                            "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                            ('ready_to_schedule', 'complete', patient_id),
+                        )
+                        reply_text = (
+                            "Thank you! We have everything we need — our scheduling team will follow up "
+                            "shortly to confirm your appointment."
+                        )
                 else:
+                    # This patient was already mid-way through a question that the
+                    # practice has since disabled or reordered out — rather than
+                    # getting stuck, just complete the flow gracefully.
                     cur.execute(
                         "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
                         ('ready_to_schedule', 'complete', patient_id),
@@ -1042,6 +1106,93 @@ def save_template_route():
 
     except Exception as e:
         log.error(f"Save template failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Per-practice intake question configuration ───────────────────────────────
+@app.route('/intake-questions', methods=['GET'])
+@require_auth
+def get_intake_questions_route():
+    """
+    GET /intake-questions?practice_id=xxx — admin/superadmin only.
+    Returns the practice's full configured question list (including
+    disabled ones, so the editor UI can show everything with toggles),
+    falling back to the built-in default if never customized.
+    Admins may only view their own practice's configuration.
+    """
+    u = request.oncue_user
+    if u['role'] not in ('admin', 'superadmin'):
+        return jsonify({'error': 'Not authorized for this action'}), 403
+
+    practice_id = request.args.get('practice_id')
+    if u['role'] == 'admin':
+        practice_id = u['practice_id']
+    if not practice_id:
+        return jsonify({'error': 'practice_id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT intake_questions FROM practices WHERE id = %s", (practice_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        questions = (row['intake_questions'] if row and row['intake_questions'] else default_intake_questions())
+        return jsonify({'questions': questions})
+    except Exception as e:
+        log.error(f"Get intake questions failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/intake-questions', methods=['POST'])
+@require_auth
+def save_intake_questions_route():
+    """
+    POST /intake-questions — admin/superadmin only.
+    Body: JSON { practice_id, questions: [{key, prompt, enabled}, ...] }
+    Saves a practice's full custom question list (order = array order).
+    Admins may only save their own practice's configuration. Unknown keys
+    are rejected defensively so a bad payload can't silently create a
+    question referencing a column that doesn't exist.
+    """
+    u = request.oncue_user
+    if u['role'] not in ('admin', 'superadmin'):
+        return jsonify({'error': 'Not authorized for this action'}), 403
+
+    data        = request.get_json()
+    practice_id = data.get('practice_id')
+    questions   = data.get('questions')
+
+    if u['role'] == 'admin':
+        practice_id = u['practice_id']
+    if not practice_id or not isinstance(questions, list):
+        return jsonify({'error': 'practice_id and questions (array) required'}), 400
+
+    for q in questions:
+        if q.get('key') not in QUESTION_COLUMN:
+            return jsonify({'error': f"Unknown question key: {q.get('key')}"}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "UPDATE practices SET intake_questions = %s WHERE id = %s RETURNING id",
+            (json.dumps(questions), practice_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Practice not found'}), 404
+
+        log_audit(cur, u, 'intake_questions.update', entity_type='practice', entity_id=practice_id,
+                  practice_id=practice_id, details={'enabled_count': sum(1 for q in questions if q.get('enabled', True))})
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        log.error(f"Save intake questions failed: {e}")
         return jsonify({'error': str(e)}), 500
 
 
