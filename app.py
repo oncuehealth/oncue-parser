@@ -222,6 +222,53 @@ def render_template(template_text, patient_name=None, doctor_name=None, practice
     )
 
 
+def send_recall_sms(cur, patient, message=None, reset_conversation=True):
+    """
+    Shared send logic used by both the manual /sms/send endpoint and the
+    automated re-engagement/reminder job, so both paths always behave
+    identically. `patient` must be a dict already joined with doctor_name/
+    practice_name (see the SELECT in /sms/send). Returns the Twilio message
+    object. Caller is responsible for conn.commit().
+    """
+    to_number = patient.get('sms_number') or patient.get('phone')
+    if not to_number:
+        raise ValueError(f"Patient {patient.get('id')} has no phone number on file")
+
+    if not message:
+        template = get_template_for_practice(cur, patient.get('practice_id'))
+        first_name = (patient.get('name') or '').split(' ')[0]
+        message = render_template(
+            template,
+            patient_name=first_name,
+            doctor_name=patient.get('doctor_name'),
+            practice_name=patient.get('practice_name'),
+            procedure=patient.get('procedure'),
+        )
+
+    client = get_twilio()
+    msg = client.messages.create(
+        messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+        to=to_number,
+        body=message,
+    )
+
+    log_conversation(
+        cur,
+        practice_id=patient.get('practice_id'),
+        patient_id=patient['id'],
+        direction='outbound',
+        body=message,
+        twilio_sid=msg.sid,
+        status=msg.status,
+    )
+    if reset_conversation:
+        cur.execute(
+            "UPDATE patients SET status = %s, conversation_state = %s, last_contacted_at = NOW() WHERE id = %s",
+            ('sms_sent', 'awaiting_consent', patient['id']),
+        )
+    return msg
+
+
 # ── Conversation flow (asked in order after patient replies YES) ────────────
 # Each entry: (conversation_state key, question text, patients column the answer is saved to)
 QUESTION_FLOW = [
@@ -303,48 +350,18 @@ def sms_send():
             conn.close()
             return jsonify({'error': 'Not authorized for this patient'}), 403
 
-        to_number = patient.get('sms_number') or patient.get('phone')
-        if not to_number:
+        try:
+            msg = send_recall_sms(cur, patient, message=message)
+        except ValueError as ve:
             cur.close()
             conn.close()
-            return jsonify({'error': 'Patient has no phone number on file'}), 400
+            return jsonify({'error': str(ve)}), 400
 
-        if not message:
-            template = get_template_for_practice(cur, patient.get('practice_id'))
-            first_name = (patient.get('name') or '').split(' ')[0]
-            message = render_template(
-                template,
-                patient_name=first_name,
-                doctor_name=patient.get('doctor_name'),
-                practice_name=patient.get('practice_name'),
-                procedure=patient.get('procedure'),
-            )
-
-        client = get_twilio()
-        msg = client.messages.create(
-            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
-            to=to_number,
-            body=message,
-        )
-
-        log_conversation(
-            cur,
-            practice_id=patient.get('practice_id'),
-            patient_id=patient_id,
-            direction='outbound',
-            body=message,
-            twilio_sid=msg.sid,
-            status=msg.status,
-        )
-        cur.execute(
-            "UPDATE patients SET status = %s, conversation_state = %s, last_contacted_at = NOW() WHERE id = %s",
-            ('sms_sent', 'awaiting_consent', patient_id),
-        )
         conn.commit()
         cur.close()
         conn.close()
 
-        log.info(f"Sent SMS to patient {patient_id} ({to_number}), Twilio SID {msg.sid}")
+        log.info(f"Sent SMS to patient {patient_id}, Twilio SID {msg.sid}")
         return jsonify({'success': True, 'twilio_sid': msg.sid, 'status': msg.status})
 
     except Exception as e:
@@ -672,6 +689,119 @@ def sms_status_callback():
     return ('', 204)
 
 
+# ── Automated re-engagement + appointment reminder job ───────────────────────
+# Meant to be called once a day by an external scheduler (e.g. a free cron
+# service or Railway's own cron feature), not by the dashboard. Protected by
+# a shared secret since it has no Firebase login to check — set CRON_SECRET
+# in Railway and pass the same value as ?key=... when configuring the cron.
+CRON_SECRET = os.environ.get('CRON_SECRET')
+
+@app.route('/jobs/run-daily', methods=['POST', 'GET'])
+def run_daily_job():
+    """
+    POST or GET /jobs/run-daily?key=<CRON_SECRET>&reengage_days=30
+    Two independent tasks, run every time this is called:
+
+    1. Re-engagement: any patient whose conversation_state is 'follow_up_later'
+       and hasn't been touched (re-engaged or originally contacted) in at
+       least `reengage_days` days gets the opening message sent again, and
+       their conversation resets to awaiting a fresh response.
+
+    2. Appointment reminders: each practice configures its own set of
+       reminder offsets (practices.reminder_days, e.g. [14,7,3,1] meaning
+       14/7/3/1 days before the appointment — set via Settings in the
+       dashboard). A scheduled patient gets a reminder on each of those days
+       that matches how far out their appointment_date is, and each specific
+       offset only ever fires once per patient (tracked in
+       patients.reminders_sent, e.g. [14,7] once those two have gone out).
+    """
+    if not CRON_SECRET or request.args.get('key') != CRON_SECRET:
+        return jsonify({'error': 'Not authorized'}), 403
+
+    reengage_days = int(request.args.get('reengage_days', 30))
+
+    reengaged = []
+    reengage_errors = []
+    reminded = []
+    reminder_errors = []
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # ── 1. Re-engagement ────────────────────────────────────────────────
+        cur.execute(f"""
+            SELECT p.*, pr.name AS doctor_name, prac.name AS practice_name
+            FROM patients p
+            LEFT JOIN profiles pr    ON pr.id   = p.provider_id
+            LEFT JOIN practices prac ON prac.id = p.practice_id
+            WHERE p.conversation_state = 'follow_up_later'
+              AND COALESCE(p.last_reengagement_sent_at, p.last_contacted_at) < NOW() - INTERVAL '{reengage_days} days'
+        """)
+        for patient in cur.fetchall():
+            try:
+                send_recall_sms(cur, patient)
+                cur.execute("UPDATE patients SET last_reengagement_sent_at = NOW() WHERE id = %s", (patient['id'],))
+                reengaged.append(patient['id'])
+            except Exception as e:
+                log.warning(f"Re-engagement failed for patient {patient['id']}: {e}")
+                reengage_errors.append({'patient_id': patient['id'], 'error': str(e)})
+        conn.commit()
+
+        # ── 2. Appointment reminders (per-practice configurable offsets) ────
+        # (appointment_date - CURRENT_DATE) is how many days out the
+        # appointment is; a reminder fires when that number is in the
+        # practice's configured reminder_days AND hasn't already been sent
+        # for that specific offset.
+        cur.execute("""
+            SELECT p.*, pr.name AS doctor_name, prac.name AS practice_name,
+                   COALESCE(prac.reminder_days, ARRAY[1]) AS reminder_days,
+                   (p.appointment_date - CURRENT_DATE) AS days_until
+            FROM patients p
+            LEFT JOIN profiles pr    ON pr.id   = p.provider_id
+            LEFT JOIN practices prac ON prac.id = p.practice_id
+            WHERE p.status = 'scheduled'
+              AND p.appointment_date IS NOT NULL
+              AND p.appointment_date >= CURRENT_DATE
+              AND (p.appointment_date - CURRENT_DATE) = ANY(COALESCE(prac.reminder_days, ARRAY[1]))
+              AND NOT ((p.appointment_date - CURRENT_DATE) = ANY(COALESCE(p.reminders_sent, ARRAY[]::integer[])))
+        """)
+        for patient in cur.fetchall():
+            try:
+                days_until = patient['days_until']
+                first_name = (patient.get('name') or '').split(' ')[0] or 'there'
+                appt = patient['appointment_date'].strftime('%B %-d') if patient.get('appointment_date') else 'your upcoming appointment'
+                when_phrase = 'tomorrow' if days_until == 1 else f'in {days_until} days'
+                reminder_text = (
+                    f"Hi {first_name}, this is a reminder from {patient.get('practice_name') or 'your medical practice'} — "
+                    f"your appointment is {when_phrase} ({appt}). Reply CALL if you need to reschedule or have any questions."
+                )
+                send_recall_sms(cur, patient, message=reminder_text, reset_conversation=False)
+                cur.execute(
+                    "UPDATE patients SET reminders_sent = array_append(COALESCE(reminders_sent, ARRAY[]::integer[]), %s) WHERE id = %s",
+                    (days_until, patient['id']),
+                )
+                reminded.append({'patient_id': patient['id'], 'days_until': days_until})
+            except Exception as e:
+                log.warning(f"Reminder failed for patient {patient['id']}: {e}")
+                reminder_errors.append({'patient_id': patient['id'], 'error': str(e)})
+        conn.commit()
+
+        cur.close()
+        conn.close()
+
+        log.info(f"Daily job: {len(reengaged)} re-engaged, {len(reminded)} reminders sent")
+        return jsonify({
+            'success': True,
+            'reengaged': reengaged, 'reengage_errors': reengage_errors,
+            'reminded': reminded, 'reminder_errors': reminder_errors,
+        })
+
+    except Exception as e:
+        log.error(f"Daily job failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 # ── Message templates (per practice) ──────────────────────────────────────────
 @app.route('/practices', methods=['GET'])
 @require_auth
@@ -690,6 +820,7 @@ def get_practices():
         base_sql = """
             SELECT
                 p.id, p.name, p.address, p.phone, p.specialty, p.created_at,
+                COALESCE(p.reminder_days, ARRAY[1]) AS reminder_days,
                 COUNT(DISTINCT pr.id) FILTER (WHERE pr.role = 'provider') AS provider_count,
                 COUNT(DISTINCT pt.id) AS patient_count
             FROM practices p
@@ -771,6 +902,7 @@ def update_practice():
     address   = data.get('address') or None
     phone     = data.get('phone') or None
     specialty = data.get('specialty') or None
+    reminder_days = data.get('reminder_days')  # e.g. [14,7,3,1] — list of int days before appointment
 
     if not name:
         return jsonify({'error': 'name required'}), 400
@@ -778,11 +910,18 @@ def update_practice():
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            UPDATE practices SET name = %s, address = %s, phone = %s, specialty = %s
-            WHERE id = %s
-            RETURNING *
-        """, (name, address, phone, specialty, practice_id))
+        if reminder_days is not None:
+            cur.execute("""
+                UPDATE practices SET name = %s, address = %s, phone = %s, specialty = %s, reminder_days = %s
+                WHERE id = %s
+                RETURNING *
+            """, (name, address, phone, specialty, reminder_days, practice_id))
+        else:
+            cur.execute("""
+                UPDATE practices SET name = %s, address = %s, phone = %s, specialty = %s
+                WHERE id = %s
+                RETURNING *
+            """, (name, address, phone, specialty, practice_id))
         row = cur.fetchone()
         conn.commit()
         cur.close()
@@ -1612,7 +1751,7 @@ def update_patient():
 
     allowed = ['name','patient_no','dob','phone','phone_type','phone2','phone2_type',
                'sms_number','sms_capable','procedure','recall_date','status',
-               'comments','flags','confidence','provider_id']
+               'comments','flags','confidence','provider_id','appointment_date']
 
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
@@ -1634,6 +1773,12 @@ def update_patient():
     # "scheduled" volume over time (not just a current snapshot count).
     if updates.get('status') == 'scheduled':
         updates['scheduled_at'] = datetime.now(timezone.utc)
+
+    # If the appointment date is being set/changed, clear any reminders
+    # already sent so a new or rescheduled date is eligible for the full
+    # set of configured reminders again.
+    if 'appointment_date' in updates:
+        updates['reminders_sent'] = []
 
     try:
         conn = get_db()
