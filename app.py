@@ -1456,13 +1456,20 @@ def analytics_trend():
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        # Build the scoped-patient-ids clause once, reused by every query below.
-        if all_flag:
-            patient_scope_sql, patient_scope_params = "TRUE", ()
-        elif practice_id:
-            patient_scope_sql, patient_scope_params = "practice_id = %s", (practice_id,)
-        else:
-            patient_scope_sql, patient_scope_params = "provider_id = %s", (provider_id,)
+        # Build the scoped-patient clause once, reused by every query below.
+        # Builds correctly whether the query references the patients table
+        # bare (no alias) or joins it in as "p" — "TRUE" must never be
+        # prefixed with a table alias, since TRUE isn't a column.
+        def scope_clause(alias=''):
+            prefix = f"{alias}." if alias else ""
+            if all_flag:
+                return "TRUE"
+            elif practice_id:
+                return f"{prefix}practice_id = %s"
+            else:
+                return f"{prefix}provider_id = %s"
+
+        patient_scope_params = () if all_flag else (practice_id,) if practice_id else (provider_id,)
 
         series = {}
 
@@ -1472,7 +1479,7 @@ def analytics_trend():
                 SELECT sc.patient_id, MIN(sc.created_at) AS first_sent
                 FROM sms_conversations sc
                 JOIN patients p ON p.id = sc.patient_id
-                WHERE sc.direction = 'outbound' AND p.{patient_scope_sql}
+                WHERE sc.direction = 'outbound' AND {scope_clause('p')}
                   AND sc.created_at >= NOW() - INTERVAL '{days} days'
                 GROUP BY sc.patient_id
             ) t GROUP BY day ORDER BY day
@@ -1485,7 +1492,7 @@ def analytics_trend():
                 SELECT sc.patient_id, MIN(sc.created_at) AS first_reply
                 FROM sms_conversations sc
                 JOIN patients p ON p.id = sc.patient_id
-                WHERE sc.direction = 'inbound' AND p.{patient_scope_sql}
+                WHERE sc.direction = 'inbound' AND {scope_clause('p')}
                   AND sc.created_at >= NOW() - INTERVAL '{days} days'
                 GROUP BY sc.patient_id
             ) t GROUP BY day ORDER BY day
@@ -1496,7 +1503,7 @@ def analytics_trend():
         cur.execute(f"""
             SELECT date_trunc('day', scheduled_at) AS day, COUNT(*) AS n
             FROM patients
-            WHERE scheduled_at IS NOT NULL AND {patient_scope_sql}
+            WHERE scheduled_at IS NOT NULL AND {scope_clause()}
               AND scheduled_at >= NOW() - INTERVAL '{days} days'
             GROUP BY day ORDER BY day
         """, patient_scope_params)
@@ -1509,7 +1516,7 @@ def analytics_trend():
                    COUNT(*) FILTER (WHERE sc.direction='inbound')  AS received
             FROM sms_conversations sc
             JOIN patients p ON p.id = sc.patient_id
-            WHERE p.{patient_scope_sql} AND sc.created_at >= NOW() - INTERVAL '{days} days'
+            WHERE {scope_clause('p')} AND sc.created_at >= NOW() - INTERVAL '{days} days'
             GROUP BY day ORDER BY day
         """, patient_scope_params)
         msg_rows = cur.fetchall()
