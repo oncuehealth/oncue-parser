@@ -62,6 +62,30 @@ def get_twilio():
     return _twilio_client
 
 
+def log_audit(cur, user, action, entity_type=None, entity_id=None, practice_id=None, details=None):
+    """
+    Insert one audit-log row. `user` is request.oncue_user (or None for
+    system/automated actions like the daily job). Call this on the same
+    cursor as the rest of the request so it commits atomically with it —
+    if the real change rolls back, the audit entry does too.
+    `details` should stay minimal (field names changed, a name snapshot for
+    deletes) rather than full PHI values, to keep the log itself low-risk.
+    """
+    cur.execute("""
+        INSERT INTO audit_log (actor_id, actor_name, actor_role, action, entity_type, entity_id, practice_id, details)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        user.get('id') if user else None,
+        user.get('name') if user else 'System (automated job)',
+        user.get('role') if user else 'system',
+        action,
+        entity_type,
+        str(entity_id) if entity_id is not None else None,
+        practice_id,
+        json.dumps(details) if details is not None else None,
+    ))
+
+
 def log_conversation(cur, practice_id, patient_id, direction, body, twilio_sid=None, status=None):
     """Insert a row into sms_conversations."""
     cur.execute("""
@@ -869,6 +893,8 @@ def create_practice():
             RETURNING *
         """, (name, address, phone, specialty))
         row = cur.fetchone()
+        log_audit(cur, request.oncue_user, 'practice.create', entity_type='practice', entity_id=row['id'],
+                  practice_id=row['id'], details={'name': name})
         conn.commit()
         cur.close()
         conn.close()
@@ -923,6 +949,9 @@ def update_practice():
                 RETURNING *
             """, (name, address, phone, specialty, practice_id))
         row = cur.fetchone()
+        if row:
+            log_audit(cur, u, 'practice.update', entity_type='practice', entity_id=practice_id,
+                      practice_id=practice_id, details={'name': name})
         conn.commit()
         cur.close()
         conn.close()
@@ -1004,6 +1033,8 @@ def save_template_route():
             RETURNING *
         """, (practice_id, template_text))
         row = cur.fetchone()
+        log_audit(cur, u, 'template.update', entity_type='template', entity_id=practice_id,
+                  practice_id=practice_id, details={'length': len(template_text)})
         conn.commit()
         cur.close()
         conn.close()
@@ -1326,6 +1357,8 @@ def create_user():
             RETURNING id
         """, (user_id, name, email, role, practice_id, True))
         new_row = cur.fetchone()
+        log_audit(cur, u, 'user.create', entity_type='user', entity_id=new_row['id'],
+                  practice_id=practice_id, details={'email': email, 'role': role, 'name': name})
         conn.commit()
         cur.close()
         conn.close()
@@ -1366,10 +1399,18 @@ def delete_practice():
             conn.close()
             return jsonify({'error': f'Cannot delete — practice has {patient_count} patients. Remove patients first.'}), 400
 
+        cur.execute("SELECT name FROM practices WHERE id = %s", (practice_id,))
+        name_row = cur.fetchone()
+        practice_name = name_row[0] if name_row else None
+
         # Delete profiles first (foreign key)
         cur.execute("DELETE FROM profiles WHERE practice_id = %s", (practice_id,))
         # Delete practice
         cur.execute("DELETE FROM practices WHERE id = %s", (practice_id,))
+
+        log_audit(cur, request.oncue_user, 'practice.delete', entity_type='practice', entity_id=practice_id,
+                  practice_id=practice_id, details={'name': practice_name})
+
         conn.commit()
 
         cur.close()
@@ -1681,6 +1722,38 @@ def analytics_trend():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/audit-log', methods=['GET'])
+@require_auth
+@require_role('admin', 'superadmin')
+def get_audit_log():
+    """
+    GET /audit-log?limit=200 — admin/superadmin only.
+    Returns the most recent audit entries, newest first. Admins only ever
+    see entries scoped to their own practice; superadmin sees everything.
+    """
+    u = request.oncue_user
+    limit = min(max(int(request.args.get('limit', 200)), 1), 1000)
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        if u['role'] == 'superadmin':
+            cur.execute("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT %s", (limit,))
+        else:
+            cur.execute(
+                "SELECT * FROM audit_log WHERE practice_id = %s ORDER BY created_at DESC LIMIT %s",
+                (u['practice_id'], limit),
+            )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        log.error(f"Get audit log failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 # ── Get providers ─────────────────────────────────────────────────────────────
 @app.route('/providers', methods=['GET'])
 @require_auth
@@ -1757,6 +1830,8 @@ def update_patient():
     if not updates:
         return jsonify({'error': 'No valid fields to update'}), 400
 
+    requested_fields = list(updates.keys())  # before derived fields (sms_number sync, scheduled_at, etc.) get added
+
     # Normalize any phone fields being updated so inbound SMS replies keep matching.
     for field in ('phone', 'phone2', 'sms_number'):
         if field in updates and updates[field]:
@@ -1792,6 +1867,13 @@ def update_patient():
         set_clause = ', '.join(f"{k} = %s" for k in updates)
         values = list(updates.values()) + [patient_id]
         cur.execute(f"UPDATE patients SET {set_clause} WHERE id = %s", values)
+
+        cur.execute("SELECT practice_id FROM patients WHERE id = %s", (patient_id,))
+        prow = cur.fetchone()
+        log_audit(cur, request.oncue_user, 'patient.update', entity_type='patient', entity_id=patient_id,
+                  practice_id=prow['practice_id'] if prow else None,
+                  details={'changed_fields': requested_fields})
+
         conn.commit()
         cur.close()
         conn.close()
@@ -1827,8 +1909,16 @@ def delete_patient():
             conn.close()
             return jsonify({'error': 'Not authorized for this patient'}), 403
 
+        cur.execute("SELECT name, practice_id FROM patients WHERE id = %s", (patient_id,))
+        prow = cur.fetchone()
+
         cur.execute("DELETE FROM sms_conversations WHERE patient_id = %s", (patient_id,))
         cur.execute("DELETE FROM patients WHERE id = %s", (patient_id,))
+
+        log_audit(cur, request.oncue_user, 'patient.delete', entity_type='patient', entity_id=patient_id,
+                  practice_id=prow['practice_id'] if prow else None,
+                  details={'name': prow['name'] if prow else None})
+
         conn.commit()
         cur.close()
         conn.close()
@@ -1919,6 +2009,8 @@ def add_patient():
             data.get('confidence','high'),
         ))
         row = cur.fetchone()
+        log_audit(cur, u, 'patient.create', entity_type='patient', entity_id=row['id'],
+                  practice_id=practice_id, details={'name': row.get('name')})
         conn.commit()
         cur.close()
         conn.close()
