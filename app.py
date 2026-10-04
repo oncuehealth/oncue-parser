@@ -8,6 +8,7 @@ import os
 import re
 import json
 import requests
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_auth_requests
@@ -1418,6 +1419,122 @@ def analytics_messages():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/analytics/trend', methods=['GET'])
+@require_auth
+def analytics_trend():
+    """
+    GET /analytics/trend?practice_id=xxx | ?provider_id=xxx | ?all=true  &days=30
+    Returns day-by-day series for charting: how many patients were first
+    reached, first responded, and became scheduled each day, plus raw
+    message volume (sent/received) per day. Same role-based scoping as
+    /patients. 'days' controls how far back to look (default 30, max 180).
+
+    Notes on what each series actually measures:
+    - reached/responded use each patient's EARLIEST outbound/inbound message
+      date, so a later resend doesn't shift their "reached" date forward.
+    - scheduled uses the new patients.scheduled_at column, which is only
+      populated going forward from when this column was added — patients
+      marked scheduled before that won't appear in this series.
+    """
+    u = request.oncue_user
+    practice_id = request.args.get('practice_id')
+    provider_id = request.args.get('provider_id')
+    all_flag    = request.args.get('all') == 'true'
+    days        = min(max(int(request.args.get('days', 30)), 1), 180)
+
+    if u['role'] == 'superadmin':
+        pass
+    elif u['role'] == 'admin':
+        practice_id, provider_id, all_flag = u['practice_id'], None, False
+    else:
+        practice_id, provider_id, all_flag = None, u['id'], False
+
+    if not practice_id and not provider_id and not all_flag:
+        return jsonify({'error': 'practice_id, provider_id, or all=true required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # Build the scoped-patient-ids clause once, reused by every query below.
+        if all_flag:
+            patient_scope_sql, patient_scope_params = "TRUE", ()
+        elif practice_id:
+            patient_scope_sql, patient_scope_params = "practice_id = %s", (practice_id,)
+        else:
+            patient_scope_sql, patient_scope_params = "provider_id = %s", (provider_id,)
+
+        series = {}
+
+        # Reached: each patient's first-ever outbound message date
+        cur.execute(f"""
+            SELECT date_trunc('day', first_sent) AS day, COUNT(*) AS n FROM (
+                SELECT sc.patient_id, MIN(sc.created_at) AS first_sent
+                FROM sms_conversations sc
+                JOIN patients p ON p.id = sc.patient_id
+                WHERE sc.direction = 'outbound' AND p.{patient_scope_sql}
+                  AND sc.created_at >= NOW() - INTERVAL '{days} days'
+                GROUP BY sc.patient_id
+            ) t GROUP BY day ORDER BY day
+        """, patient_scope_params)
+        series['reached'] = {r['day'].date().isoformat(): r['n'] for r in cur.fetchall()}
+
+        # Responded: each patient's first-ever inbound message date
+        cur.execute(f"""
+            SELECT date_trunc('day', first_reply) AS day, COUNT(*) AS n FROM (
+                SELECT sc.patient_id, MIN(sc.created_at) AS first_reply
+                FROM sms_conversations sc
+                JOIN patients p ON p.id = sc.patient_id
+                WHERE sc.direction = 'inbound' AND p.{patient_scope_sql}
+                  AND sc.created_at >= NOW() - INTERVAL '{days} days'
+                GROUP BY sc.patient_id
+            ) t GROUP BY day ORDER BY day
+        """, patient_scope_params)
+        series['responded'] = {r['day'].date().isoformat(): r['n'] for r in cur.fetchall()}
+
+        # Scheduled: when status was set to 'scheduled' (new column, forward-looking only)
+        cur.execute(f"""
+            SELECT date_trunc('day', scheduled_at) AS day, COUNT(*) AS n
+            FROM patients
+            WHERE scheduled_at IS NOT NULL AND {patient_scope_sql}
+              AND scheduled_at >= NOW() - INTERVAL '{days} days'
+            GROUP BY day ORDER BY day
+        """, patient_scope_params)
+        series['scheduled'] = {r['day'].date().isoformat(): r['n'] for r in cur.fetchall()}
+
+        # Raw message volume per day, split by direction
+        cur.execute(f"""
+            SELECT date_trunc('day', sc.created_at) AS day,
+                   COUNT(*) FILTER (WHERE sc.direction='outbound') AS sent,
+                   COUNT(*) FILTER (WHERE sc.direction='inbound')  AS received
+            FROM sms_conversations sc
+            JOIN patients p ON p.id = sc.patient_id
+            WHERE p.{patient_scope_sql} AND sc.created_at >= NOW() - INTERVAL '{days} days'
+            GROUP BY day ORDER BY day
+        """, patient_scope_params)
+        msg_rows = cur.fetchall()
+        series['messages_sent']     = {r['day'].date().isoformat(): r['sent'] for r in msg_rows}
+        series['messages_received'] = {r['day'].date().isoformat(): r['received'] for r in msg_rows}
+
+        cur.close()
+        conn.close()
+
+        # Build a complete, zero-filled day axis so the frontend doesn't have to.
+        day_labels = []
+        for i in range(days - 1, -1, -1):
+            day_labels.append((datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat())
+
+        result = {'days': day_labels}
+        for key in ('reached', 'responded', 'scheduled', 'messages_sent', 'messages_received'):
+            result[key] = [series[key].get(d, 0) for d in day_labels]
+
+        return jsonify(result)
+
+    except Exception as e:
+        log.error(f"Analytics trend failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 # ── Get providers ─────────────────────────────────────────────────────────────
 @app.route('/providers', methods=['GET'])
 @require_auth
@@ -1505,6 +1622,11 @@ def update_patient():
     # actually gets texted, since the old sms_number keeps winning.
     if 'phone' in updates and 'sms_number' not in updates:
         updates['sms_number'] = updates['phone']
+
+    # Record when a patient became scheduled, so trend charts can show
+    # "scheduled" volume over time (not just a current snapshot count).
+    if updates.get('status') == 'scheduled':
+        updates['scheduled_at'] = datetime.now(timezone.utc)
 
     try:
         conn = get_db()
