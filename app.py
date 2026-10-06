@@ -2079,6 +2079,83 @@ def delete_patient():
         return jsonify({'error': str(e)}), 500
 
 
+# ── Live phone re-check (Twilio Lookup Line Type Intelligence) ──────────────
+@app.route('/patients/recheck-phone', methods=['POST'])
+@require_auth
+def recheck_phone():
+    """
+    POST /patients/recheck-phone
+    Body: JSON { id }
+
+    Runs a live Twilio Lookup (Line Type Intelligence) against the patient's
+    current phone number and returns the up-to-date line type + carrier.
+
+    This exists for the specific gap between two different moments:
+      - phone_type/sms_capable are set ONCE, at upload time, from a lookup
+        done then (see lookup_patient_phones in /parse and /save).
+      - A later SMS send can still fail with Twilio error 30006 ("Landline
+        or unreachable carrier"), which doesn't necessarily mean the cached
+        classification was wrong — it can also fire for a genuinely mobile
+        number that hit a carrier-routing gap on this specific send.
+    A fresh Lookup call lets staff tell these two cases apart without
+    needing the Twilio console: if it still comes back mobile/nonFixedVoip,
+    the failure was likely transient (worth a resend); if it comes back
+    landline/fixedVoip, the number genuinely can't receive SMS.
+
+    Also updates patients.phone_type with the fresh result so the cached
+    value doesn't stay stale, and logs an audit entry.
+    """
+    data = request.get_json()
+    patient_id = data.get('id')
+    if not patient_id:
+        return jsonify({'error': 'id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        patient = patient_in_scope(cur, patient_id, request.oncue_user)
+        if not patient:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Not authorized for this patient'}), 403
+
+        phone = patient.get('sms_number') or patient.get('phone')
+        if not phone:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'No phone number on file for this patient'}), 400
+
+        try:
+            result = get_twilio().lookups.v2.phone_numbers(phone).fetch(fields='line_type_intelligence')
+        except Exception as e:
+            log.warning(f"Lookup failed for patient {patient_id} ({phone}): {e}")
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Lookup failed: {e}'}), 502
+
+        lti          = result.line_type_intelligence or {}
+        line_type    = lti.get('type') or 'unknown'
+        carrier_name = lti.get('carrier_name')
+
+        cur.execute("UPDATE patients SET phone_type = %s WHERE id = %s", (line_type, patient_id))
+        log_audit(cur, request.oncue_user, 'patient.recheck_phone', entity_type='patient', entity_id=patient_id,
+                  practice_id=patient.get('practice_id'), details={'line_type': line_type})
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            'success': True,
+            'line_type': line_type,
+            'carrier_name': carrier_name,
+            'national_format': result.national_format,
+        })
+    except Exception as e:
+        log.error(f"Recheck phone failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 # ── Add single patient ─────────────────────────────────────────────────────────
 @app.route('/patients/add', methods=['POST'])
 @require_auth
