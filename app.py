@@ -62,6 +62,26 @@ def get_twilio():
     return _twilio_client
 
 
+def sms_capable_from_line_type(line_type):
+    """
+    Maps a Twilio Lookup Line Type Intelligence `type` value to a definite
+    sms_capable boolean, or None when Lookup genuinely doesn't give us a
+    clear answer. This is also the honest reason a patient can land in
+    "unknown" even though Lookup ran: Lookup's own classification can come
+    back as 'unknown' (common for some prepaid/international numbers the
+    carrier database doesn't have clean data for), or the Lookup call itself
+    can fail/error at the time it was run (network hiccup, bad number
+    format) — both cases are caught and stored as unknown rather than
+    guessed at. It isn't that Lookup "doesn't always say" mobile or
+    landline; it's one of these two things happening upstream.
+    """
+    if line_type in ('mobile', 'nonFixedVoip'):
+        return True
+    if line_type in ('landline', 'fixedVoip'):
+        return False
+    return None  # voicemail, tollFree, personal, unknown, or lookup error
+
+
 def log_audit(cur, user, action, entity_type=None, entity_id=None, practice_id=None, details=None):
     """
     Insert one audit-log row. `user` is request.oncue_user (or None for
@@ -478,6 +498,13 @@ def sms_send_bulk():
             to_number = patient.get('sms_number') or patient.get('phone')
             if not to_number:
                 results.append({'patient_id': patient_id, 'success': False, 'error': 'no phone on file'})
+                continue
+
+            if patient.get('sms_capable') is False:
+                # Known landline from the upload-time Lookup — don't waste a
+                # send attempt that's already known to fail (and would just
+                # produce another 30006). Call queue staff should call these.
+                results.append({'patient_id': patient_id, 'success': False, 'error': 'landline — call instead, not sent'})
                 continue
 
             if message:
@@ -1983,52 +2010,72 @@ def update_patient():
 
     requested_fields = list(updates.keys())  # before derived fields (sms_number sync, scheduled_at, etc.) get added
 
-    # Normalize any phone fields being updated so inbound SMS replies keep matching.
-    for field in ('phone', 'phone2', 'sms_number'):
-        if field in updates and updates[field]:
-            updates[field] = normalize_phone(updates[field])
-
-    # SMS sends use sms_number first, falling back to phone — so if the caller
-    # edited 'phone' but didn't separately specify 'sms_number', keep them in
-    # sync. Otherwise an edited phone silently has no effect on what number
-    # actually gets texted, since the old sms_number keeps winning.
-    if 'phone' in updates and 'sms_number' not in updates:
-        updates['sms_number'] = updates['phone']
-
-    # Record when a patient became scheduled, so trend charts can show
-    # "scheduled" volume over time (not just a current snapshot count).
-    if updates.get('status') == 'scheduled':
-        updates['scheduled_at'] = datetime.now(timezone.utc)
-
-    # If the appointment date is being set/changed, clear any reminders
-    # already sent so a new or rescheduled date is eligible for the full
-    # set of configured reminders again.
-    if 'appointment_date' in updates:
-        updates['reminders_sent'] = []
-
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        if not patient_in_scope(cur, patient_id, request.oncue_user):
+        current = patient_in_scope(cur, patient_id, request.oncue_user)
+        if not current:
             cur.close()
             conn.close()
             return jsonify({'error': 'Not authorized for this patient'}), 403
+
+        # Normalize any phone fields being updated so inbound SMS replies keep matching.
+        for field in ('phone', 'phone2', 'sms_number'):
+            if field in updates and updates[field]:
+                updates[field] = normalize_phone(updates[field])
+
+        # SMS sends use sms_number first, falling back to phone — so if the caller
+        # edited 'phone' but didn't separately specify 'sms_number', keep them in
+        # sync. Otherwise an edited phone silently has no effect on what number
+        # actually gets texted, since the old sms_number keeps winning.
+        if 'phone' in updates and 'sms_number' not in updates:
+            updates['sms_number'] = updates['phone']
+
+        # The edit form always re-sends 'phone' on every save, so only treat
+        # this as a real phone change if the normalized value actually
+        # differs from what's stored. When it genuinely changed, the old
+        # sms_capable/phone_type (from the one-time Lookup at upload) no
+        # longer describes this number — re-run Lookup live so a manually
+        # entered mobile number is immediately usable for SMS, instead of
+        # silently staying flagged under the old number's landline/unknown
+        # status (which would otherwise keep bulk sends skipping them).
+        new_phone = updates.get('phone') or updates.get('sms_number')
+        old_phone = current.get('sms_number') or current.get('phone')
+        if new_phone and new_phone != old_phone and 'sms_capable' not in updates:
+            try:
+                result = get_twilio().lookups.v2.phone_numbers(new_phone).fetch(fields='line_type_intelligence')
+                lti = result.line_type_intelligence or {}
+                line_type = lti.get('type') or 'unknown'
+            except Exception as e:
+                log.warning(f"Lookup on edited phone failed for patient {patient_id}: {e}")
+                line_type = 'unknown'
+            updates['phone_type']  = line_type
+            updates['sms_capable'] = sms_capable_from_line_type(line_type)
+
+        # Record when a patient became scheduled, so trend charts can show
+        # "scheduled" volume over time (not just a current snapshot count).
+        if updates.get('status') == 'scheduled':
+            updates['scheduled_at'] = datetime.now(timezone.utc)
+
+        # If the appointment date is being set/changed, clear any reminders
+        # already sent so a new or rescheduled date is eligible for the full
+        # set of configured reminders again.
+        if 'appointment_date' in updates:
+            updates['reminders_sent'] = []
 
         set_clause = ', '.join(f"{k} = %s" for k in updates)
         values = list(updates.values()) + [patient_id]
         cur.execute(f"UPDATE patients SET {set_clause} WHERE id = %s", values)
 
-        cur.execute("SELECT practice_id FROM patients WHERE id = %s", (patient_id,))
-        prow = cur.fetchone()
         log_audit(cur, request.oncue_user, 'patient.update', entity_type='patient', entity_id=patient_id,
-                  practice_id=prow['practice_id'] if prow else None,
+                  practice_id=current.get('practice_id'),
                   details={'changed_fields': requested_fields})
 
         conn.commit()
         cur.close()
         conn.close()
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'phone_type': updates.get('phone_type'), 'sms_capable': updates.get('sms_capable')})
     except Exception as e:
         log.error(f"Update patient failed: {e}")
         return jsonify({'error': str(e)}), 500
@@ -2137,8 +2184,9 @@ def recheck_phone():
         lti          = result.line_type_intelligence or {}
         line_type    = lti.get('type') or 'unknown'
         carrier_name = lti.get('carrier_name')
+        sms_capable  = sms_capable_from_line_type(line_type)
 
-        cur.execute("UPDATE patients SET phone_type = %s WHERE id = %s", (line_type, patient_id))
+        cur.execute("UPDATE patients SET phone_type = %s, sms_capable = %s WHERE id = %s", (line_type, sms_capable, patient_id))
         log_audit(cur, request.oncue_user, 'patient.recheck_phone', entity_type='patient', entity_id=patient_id,
                   practice_id=patient.get('practice_id'), details={'line_type': line_type})
         conn.commit()
@@ -2149,6 +2197,7 @@ def recheck_phone():
             'success': True,
             'line_type': line_type,
             'carrier_name': carrier_name,
+            'sms_capable': sms_capable,
             'national_format': result.national_format,
         })
     except Exception as e:
