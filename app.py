@@ -321,7 +321,7 @@ QUESTION_FLOW = [
     ('q_address',      "What is your current mailing address?",                                                               'updated_address'),
     ('q_allergies',    "Do you have any medication allergies? Reply NONE if not.",                                            'allergies'),
     ('q_bloodthinner', "Are you currently taking any blood thinners or GLP-1 medications (e.g. Ozempic, Wegovy, Trulicity)? Reply NONE if not.", 'blood_thinner_glp1'),
-    ('q_insurance',    "What insurance do you have? Please include the provider name and member ID if you have it handy.",    'insurance_info'),
+    ('q_insurance',    "What insurance do you have? Please include the provider name and member ID if you have it handy. Reply SKIP if you don't have it on hand.", 'insurance_info'),
     ('q_preference',   "Do you have a preference for appointment date or time?",                                              'scheduling_preference'),
 ]
 QUESTION_STATES  = [q[0] for q in QUESTION_FLOW]
@@ -367,6 +367,21 @@ CALL_REQUEST_KEYWORDS = ('CALL', 'PHONE', 'SPEAK', 'TALK')
 YES_KEYWORDS          = ('YES', 'Y', 'SURE', 'OK', 'OKAY')
 NO_KEYWORDS           = ('NO', 'N')
 STOP_KEYWORDS         = ('STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'OPTOUT', 'REVOKE')
+# Recognized for ANY intake question (not just insurance) — a question's own
+# prompt wording is what actually invites a patient to use it (only the
+# insurance prompt mentions SKIP by default right now), but the state
+# machine honors it everywhere so enabling it on another question later, or
+# a patient using it unprompted, both work correctly rather than saving
+# "SKIP" itself as if it were a real answer.
+SKIP_KEYWORDS         = ('SKIP', 'DK', 'IDK', "DON'T KNOW", 'DONT KNOW', 'UNKNOWN', 'N/A', 'NA')
+
+# Sent when a patient replies NO to the opening message. Pulled out as a
+# constant because the daily job also re-sends this exact text to patients
+# who answered NO but then went silent before answering LATER/NOT NOW.
+RESCHEDULE_PREF_PROMPT = (
+    "No problem. Would you like us to reach out again at a later date, "
+    "or would you prefer not to schedule at this time? Reply LATER or NOT NOW."
+)
 
 # ── Health check ────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
@@ -650,14 +665,17 @@ def sms_webhook():
                             "Thank you! Our scheduling team will follow up shortly to confirm your appointment."
                         )
                 elif body_upper in NO_KEYWORDS:
+                    # Also set status (not just conversation_state) so this patient is
+                    # visibly distinct in the queue — previously status was left
+                    # untouched here, so a patient who replied NO but never answered
+                    # the LATER/NOT-NOW follow-up looked identical to one who'd never
+                    # responded at all. last_contacted_at marks this as the last
+                    # meaningful touch so the daily job can find them if they go quiet.
                     cur.execute(
-                        "UPDATE patients SET conversation_state = %s WHERE id = %s",
-                        ('awaiting_reschedule_pref', patient_id),
+                        "UPDATE patients SET status = %s, conversation_state = %s, last_contacted_at = NOW() WHERE id = %s",
+                        ('needs_review', 'awaiting_reschedule_pref', patient_id),
                     )
-                    reply_text = (
-                        "No problem. Would you like us to reach out again at a later date, "
-                        "or would you prefer not to schedule at this time? Reply LATER or NOT NOW."
-                    )
+                    reply_text = RESCHEDULE_PREF_PROMPT
                 else:
                     reply_text = (
                         "Sorry, I didn't quite catch that — reply YES if you're able to answer a "
@@ -681,9 +699,15 @@ def sms_webhook():
             elif state in QUESTION_STATES:
                 # Save the answer to this question's column (column mapping is
                 # fixed regardless of practice customization — only the
-                # order/wording/enabled-ness is configurable).
+                # order/wording/enabled-ness is configurable). A SKIP-type
+                # reply stores a clear 'Skipped' marker instead of the literal
+                # reply, so staff can tell "patient explicitly skipped this"
+                # apart from "we just don't have this data" when they look at
+                # the patient's intake answers — worth a follow-up call for
+                # specifically that field rather than assuming it was never asked.
                 column = QUESTION_COLUMN[state]
-                cur.execute(f"UPDATE patients SET {column} = %s WHERE id = %s", (body, patient_id))
+                answer = 'Skipped' if body_upper in SKIP_KEYWORDS else body
+                cur.execute(f"UPDATE patients SET {column} = %s WHERE id = %s", (answer, patient_id))
 
                 questions = get_intake_questions(cur, patient.get('practice_id'))
                 keys_in_order = [q['key'] for q in questions]
@@ -814,8 +838,8 @@ CRON_SECRET = os.environ.get('CRON_SECRET')
 @app.route('/jobs/run-daily', methods=['POST', 'GET'])
 def run_daily_job():
     """
-    POST or GET /jobs/run-daily?key=<CRON_SECRET>&reengage_days=30
-    Two independent tasks, run every time this is called:
+    POST or GET /jobs/run-daily?key=<CRON_SECRET>&reengage_days=30&pref_reengage_days=3
+    Three independent tasks, run every time this is called:
 
     1. Re-engagement: any patient whose conversation_state is 'follow_up_later'
        and hasn't been touched (re-engaged or originally contacted) in at
@@ -829,16 +853,29 @@ def run_daily_job():
        that matches how far out their appointment_date is, and each specific
        offset only ever fires once per patient (tracked in
        patients.reminders_sent, e.g. [14,7] once those two have gone out).
+
+    3. Reschedule-preference nudge: a patient who replied NO to the opening
+       message lands on conversation_state 'awaiting_reschedule_pref' and is
+       asked to reply LATER or NOT NOW. If they go quiet there instead of
+       answering, they'd otherwise sit stuck forever — uncategorized as
+       either follow_up_later or declined, and never picked up by task 1
+       since that only looks at 'follow_up_later'. After `pref_reengage_days`
+       days of silence, this re-sends the same LATER/NOT-NOW question (a
+       lighter, shorter window than the full recall cycle in task 1, since
+       the patient already engaged once and this is just a missed reply).
     """
     if not CRON_SECRET or request.args.get('key') != CRON_SECRET:
         return jsonify({'error': 'Not authorized'}), 403
 
-    reengage_days = int(request.args.get('reengage_days', 30))
+    reengage_days      = int(request.args.get('reengage_days', 30))
+    pref_reengage_days = int(request.args.get('pref_reengage_days', 3))
 
     reengaged = []
     reengage_errors = []
     reminded = []
     reminder_errors = []
+    pref_nudged = []
+    pref_nudge_errors = []
 
     try:
         conn = get_db()
@@ -902,14 +939,34 @@ def run_daily_job():
                 reminder_errors.append({'patient_id': patient['id'], 'error': str(e)})
         conn.commit()
 
+        # ── 3. Reschedule-preference nudge (stuck after a NO reply) ──────────
+        cur.execute(f"""
+            SELECT p.*, pr.name AS doctor_name, prac.name AS practice_name
+            FROM patients p
+            LEFT JOIN profiles pr    ON pr.id   = p.provider_id
+            LEFT JOIN practices prac ON prac.id = p.practice_id
+            WHERE p.conversation_state = 'awaiting_reschedule_pref'
+              AND COALESCE(p.last_reengagement_sent_at, p.last_contacted_at) < NOW() - INTERVAL '{pref_reengage_days} days'
+        """)
+        for patient in cur.fetchall():
+            try:
+                send_recall_sms(cur, patient, message=RESCHEDULE_PREF_PROMPT, reset_conversation=False)
+                cur.execute("UPDATE patients SET last_reengagement_sent_at = NOW() WHERE id = %s", (patient['id'],))
+                pref_nudged.append(patient['id'])
+            except Exception as e:
+                log.warning(f"Reschedule-pref nudge failed for patient {patient['id']}: {e}")
+                pref_nudge_errors.append({'patient_id': patient['id'], 'error': str(e)})
+        conn.commit()
+
         cur.close()
         conn.close()
 
-        log.info(f"Daily job: {len(reengaged)} re-engaged, {len(reminded)} reminders sent")
+        log.info(f"Daily job: {len(reengaged)} re-engaged, {len(reminded)} reminders sent, {len(pref_nudged)} reschedule-pref nudges")
         return jsonify({
             'success': True,
             'reengaged': reengaged, 'reengage_errors': reengage_errors,
             'reminded': reminded, 'reminder_errors': reminder_errors,
+            'pref_nudged': pref_nudged, 'pref_nudge_errors': pref_nudge_errors,
         })
 
     except Exception as e:
