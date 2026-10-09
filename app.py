@@ -838,13 +838,22 @@ CRON_SECRET = os.environ.get('CRON_SECRET')
 @app.route('/jobs/run-daily', methods=['POST', 'GET'])
 def run_daily_job():
     """
-    POST or GET /jobs/run-daily?key=<CRON_SECRET>&reengage_days=30&pref_reengage_days=3
+    POST or GET /jobs/run-daily?key=<CRON_SECRET>&pref_reengage_days=3
     Three independent tasks, run every time this is called:
 
-    1. Re-engagement: any patient whose conversation_state is 'follow_up_later'
-       and hasn't been touched (re-engaged or originally contacted) in at
-       least `reengage_days` days gets the opening message sent again, and
-       their conversation resets to awaiting a fresh response.
+    1. Recall reminders: covers both a patient who never responded to the
+       initial outreach at all (conversation_state 'awaiting_consent') and
+       one who explicitly asked to be followed up later ('follow_up_later')
+       — both just need the opening message resent periodically until they
+       respond. Each practice configures its own offsets in days
+       (practices.recall_reminder_days, e.g. [1,3,7,30] — set via Settings),
+       and a cap on how many attempts to make (practices.max_recall_attempts,
+       default 3) before giving up. Each patient's progress through their
+       own offsets is tracked in patients.recall_reminders_sent so a given
+       offset only ever fires once per patient. Once a patient's attempt
+       count reaches the practice's cap, status is set to 'no_response'
+       instead of sending yet another reminder — surfaced in the dashboard
+       as its own category rather than silently retrying forever.
 
     2. Appointment reminders: each practice configures its own set of
        reminder offsets (practices.reminder_days, e.g. [14,7,3,1] meaning
@@ -867,11 +876,11 @@ def run_daily_job():
     if not CRON_SECRET or request.args.get('key') != CRON_SECRET:
         return jsonify({'error': 'Not authorized'}), 403
 
-    reengage_days      = int(request.args.get('reengage_days', 30))
     pref_reengage_days = int(request.args.get('pref_reengage_days', 3))
 
     reengaged = []
     reengage_errors = []
+    no_response = []
     reminded = []
     reminder_errors = []
     pref_nudged = []
@@ -881,22 +890,49 @@ def run_daily_job():
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        # ── 1. Re-engagement ────────────────────────────────────────────────
-        cur.execute(f"""
-            SELECT p.*, pr.name AS doctor_name, prac.name AS practice_name
+        # ── 1. Recall reminders (per-practice configurable offsets + attempt cap) ──
+        # days_since_contact mirrors the appointment-reminder task's days_until
+        # pattern, just measured forward from last contact instead of backward
+        # from a future appointment date. attempts_sent is how many recall
+        # reminders this patient has already received in their current cycle.
+        cur.execute("""
+            SELECT p.*, pr.name AS doctor_name, prac.name AS practice_name,
+                   COALESCE(prac.recall_reminder_days, ARRAY[1,3,7,30]) AS recall_reminder_days,
+                   COALESCE(prac.max_recall_attempts, 3) AS max_recall_attempts,
+                   (CURRENT_DATE - COALESCE(p.last_reengagement_sent_at, p.last_contacted_at)::date) AS days_since_contact,
+                   COALESCE(array_length(p.recall_reminders_sent, 1), 0) AS attempts_sent
             FROM patients p
             LEFT JOIN profiles pr    ON pr.id   = p.provider_id
             LEFT JOIN practices prac ON prac.id = p.practice_id
-            WHERE p.conversation_state = 'follow_up_later'
-              AND COALESCE(p.last_reengagement_sent_at, p.last_contacted_at) < NOW() - INTERVAL '{reengage_days} days'
+            WHERE p.conversation_state IN ('awaiting_consent', 'follow_up_later')
+              AND (CURRENT_DATE - COALESCE(p.last_reengagement_sent_at, p.last_contacted_at)::date)
+                    = ANY(COALESCE(prac.recall_reminder_days, ARRAY[1,3,7,30]))
+              AND NOT ((CURRENT_DATE - COALESCE(p.last_reengagement_sent_at, p.last_contacted_at)::date)
+                    = ANY(COALESCE(p.recall_reminders_sent, ARRAY[]::integer[])))
+              AND COALESCE(array_length(p.recall_reminders_sent, 1), 0) < COALESCE(prac.max_recall_attempts, 3)
         """)
         for patient in cur.fetchall():
             try:
                 send_recall_sms(cur, patient)
-                cur.execute("UPDATE patients SET last_reengagement_sent_at = NOW() WHERE id = %s", (patient['id'],))
+                new_attempts = patient['attempts_sent'] + 1
+                hit_cap = new_attempts >= patient['max_recall_attempts']
+                if hit_cap:
+                    # Final allowed attempt just went out with still no response —
+                    # stop auto-retrying and surface this patient as its own
+                    # category for staff rather than silently retrying forever.
+                    cur.execute(
+                        "UPDATE patients SET recall_reminders_sent = array_append(COALESCE(recall_reminders_sent, ARRAY[]::integer[]), %s), last_reengagement_sent_at = NOW(), status = 'no_response' WHERE id = %s",
+                        (patient['days_since_contact'], patient['id'])
+                    )
+                    no_response.append(patient['id'])
+                else:
+                    cur.execute(
+                        "UPDATE patients SET recall_reminders_sent = array_append(COALESCE(recall_reminders_sent, ARRAY[]::integer[]), %s), last_reengagement_sent_at = NOW() WHERE id = %s",
+                        (patient['days_since_contact'], patient['id'])
+                    )
                 reengaged.append(patient['id'])
             except Exception as e:
-                log.warning(f"Re-engagement failed for patient {patient['id']}: {e}")
+                log.warning(f"Recall reminder failed for patient {patient['id']}: {e}")
                 reengage_errors.append({'patient_id': patient['id'], 'error': str(e)})
         conn.commit()
 
@@ -961,10 +997,10 @@ def run_daily_job():
         cur.close()
         conn.close()
 
-        log.info(f"Daily job: {len(reengaged)} re-engaged, {len(reminded)} reminders sent, {len(pref_nudged)} reschedule-pref nudges")
+        log.info(f"Daily job: {len(reengaged)} recall reminders sent ({len(no_response)} hit the attempt cap), {len(reminded)} appointment reminders sent, {len(pref_nudged)} reschedule-pref nudges")
         return jsonify({
             'success': True,
-            'reengaged': reengaged, 'reengage_errors': reengage_errors,
+            'reengaged': reengaged, 'reengage_errors': reengage_errors, 'no_response': no_response,
             'reminded': reminded, 'reminder_errors': reminder_errors,
             'pref_nudged': pref_nudged, 'pref_nudge_errors': pref_nudge_errors,
         })
@@ -1059,8 +1095,18 @@ def create_practice():
 def update_practice():
     """
     POST /practices/update — admin/superadmin only.
-    Body: JSON { id, name, address, phone, specialty }
+    Body: JSON { id, name, address, phone, specialty, reminder_days,
+                 recall_reminder_days, max_recall_attempts }
     Admins may only update their own practice.
+
+    - reminder_days: e.g. [14,7,3,1] — days before an appointment to remind a
+      SCHEDULED patient.
+    - recall_reminder_days: e.g. [1,3,7,30] — days of silence after the
+      initial outreach (or after a prior recall reminder) before resending
+      it to a patient who hasn't responded at all, or who said they'd like
+      a follow-up later.
+    - max_recall_attempts: how many recall reminders to send before giving
+      up and marking the patient status 'no_response' instead of keep trying.
     """
     u    = request.oncue_user
     data = request.get_json()
@@ -1073,29 +1119,22 @@ def update_practice():
         return jsonify({'error': 'id required'}), 400
 
     name      = (data.get('name') or '').strip()
-    address   = data.get('address') or None
-    phone     = data.get('phone') or None
-    specialty = data.get('specialty') or None
-    reminder_days = data.get('reminder_days')  # e.g. [14,7,3,1] — list of int days before appointment
-
     if not name:
         return jsonify({'error': 'name required'}), 400
+
+    fields  = {'name': name, 'address': data.get('address') or None, 'phone': data.get('phone') or None, 'specialty': data.get('specialty') or None}
+    if data.get('reminder_days') is not None:
+        fields['reminder_days'] = data['reminder_days']
+    if data.get('recall_reminder_days') is not None:
+        fields['recall_reminder_days'] = data['recall_reminder_days']
+    if data.get('max_recall_attempts') is not None:
+        fields['max_recall_attempts'] = data['max_recall_attempts']
 
     try:
         conn = get_db()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        if reminder_days is not None:
-            cur.execute("""
-                UPDATE practices SET name = %s, address = %s, phone = %s, specialty = %s, reminder_days = %s
-                WHERE id = %s
-                RETURNING *
-            """, (name, address, phone, specialty, reminder_days, practice_id))
-        else:
-            cur.execute("""
-                UPDATE practices SET name = %s, address = %s, phone = %s, specialty = %s
-                WHERE id = %s
-                RETURNING *
-            """, (name, address, phone, specialty, practice_id))
+        set_clause = ', '.join(f"{k} = %s" for k in fields)
+        cur.execute(f"UPDATE practices SET {set_clause} WHERE id = %s RETURNING *", list(fields.values()) + [practice_id])
         row = cur.fetchone()
         if row:
             log_audit(cur, u, 'practice.update', entity_type='practice', entity_id=practice_id,
