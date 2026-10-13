@@ -1510,14 +1510,21 @@ def save_patients():
                 practice_id, provider_id, name, patient_no, dob,
                 phone, phone_type, phone2, phone2_type, sms_number,
                 sms_capable, procedure, recall_date, status,
-                comments, flags, confidence
+                comments, flags, confidence, uploaded_at
             ) VALUES (
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
-                %s, %s, %s
+                %s, %s, %s, %s
             )
         """
+
+        # One shared timestamp for every row in this batch, computed once
+        # (rather than relying on each row's own insert instant) so the whole
+        # upload can be grouped and filtered as a single unit afterward —
+        # e.g. "patients uploaded today" always means exactly one batch's
+        # worth of rows, not whichever happened to land in the same second.
+        batch_time = datetime.now(timezone.utc)
 
         rows = []
         skipped_duplicates = []
@@ -1550,6 +1557,7 @@ def save_patients():
                 p.get('comments', '').strip() or None,
                 p.get('flags', []),
                 p.get('confidence', 'high'),
+                batch_time,
             ))
 
         if rows:
@@ -2098,7 +2106,7 @@ def update_patient():
 
     allowed = ['name','patient_no','dob','phone','phone_type','phone2','phone2_type',
                'sms_number','sms_capable','procedure','recall_date','status',
-               'comments','flags','confidence','provider_id','appointment_date']
+               'comments','flags','confidence','provider_id','appointment_date','reviewed_at']
 
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
