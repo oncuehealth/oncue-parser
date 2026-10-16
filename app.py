@@ -2319,6 +2319,87 @@ def recheck_phone():
 
 
 # ── Add single patient ─────────────────────────────────────────────────────────
+@app.route('/patients/add-recall', methods=['POST'])
+@require_auth
+def add_recall():
+    """
+    POST /patients/add-recall
+    Body: JSON { patient_id, procedure, recall_date }
+
+    Call Queue doubles as a recall management system, and the same real
+    patient can legitimately be due for more than one procedure on
+    different timelines (e.g. an EGD now, a colonoscopy held off for
+    later) — each needs to be worked independently: SMS sent for one
+    without touching the other's status at all.
+
+    Rather than restructuring the schema around a separate recalls table
+    (which would mean rewriting the SMS webhook, the daily job, and every
+    dashboard view that currently operates on a single `patients` row),
+    this clones the patient's contact/identity fields into a NEW row with
+    the new procedure, recall date, and a fresh conversation state, and
+    links the two rows via patient_group_id so the dashboard can show them
+    together as the same person. Everything downstream — sending, the
+    webhook, status tracking, reminders — then works per-row exactly as it
+    already does for any other patient, with zero changes needed there.
+    """
+    data = request.get_json()
+    patient_id  = data.get('patient_id')
+    procedure   = (data.get('procedure') or '').strip()
+    recall_date = (data.get('recall_date') or '').strip() or None
+
+    if not patient_id or not procedure:
+        return jsonify({'error': 'patient_id and procedure required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        source = patient_in_scope(cur, patient_id, request.oncue_user)
+        if not source:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Not authorized for this patient'}), 403
+
+        # The group id is just the first recall's own id — established the
+        # moment a second recall is actually added, not pre-assigned to
+        # every patient on upload (most patients only ever have one recall).
+        group_id = source.get('patient_group_id') or source['id']
+        if not source.get('patient_group_id'):
+            cur.execute("UPDATE patients SET patient_group_id = %s WHERE id = %s", (group_id, source['id']))
+
+        cur.execute("""
+            INSERT INTO patients (
+                practice_id, provider_id, name, patient_no, dob,
+                phone, phone_type, phone2, phone2_type, sms_number, sms_capable,
+                procedure, recall_date, status, comments, flags, confidence,
+                insurance_info, allergies, blood_thinner_glp1,
+                uploaded_at, patient_group_id
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                NOW(), %s
+            ) RETURNING *
+        """, (
+            source['practice_id'], source['provider_id'], source['name'], source.get('patient_no'), source.get('dob'),
+            source.get('phone'), source.get('phone_type'), source.get('phone2'), source.get('phone2_type'), source.get('sms_number'), source.get('sms_capable'),
+            procedure, recall_date, 'ready', source.get('comments'), source.get('flags') or [], source.get('confidence') or 'high',
+            source.get('insurance_info'), source.get('allergies'), source.get('blood_thinner_glp1'),
+            group_id
+        ))
+        new_row = cur.fetchone()
+        log_audit(cur, request.oncue_user, 'patient.add_recall', entity_type='patient', entity_id=new_row['id'],
+                  practice_id=source['practice_id'], details={'procedure': procedure, 'recall_date': recall_date, 'linked_to': patient_id})
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(dict(new_row))
+    except Exception as e:
+        log.error(f"Add recall failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/patients/add', methods=['POST'])
 @require_auth
 @require_role('admin', 'superadmin', 'provider')
