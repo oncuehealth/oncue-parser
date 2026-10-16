@@ -2162,6 +2162,15 @@ def update_patient():
         if updates.get('status') == 'scheduled':
             updates['scheduled_at'] = datetime.now(timezone.utc)
 
+        # The manual "Opt out" button in the dashboard only ever set `status`,
+        # not conversation_state — unlike the SMS webhook's STOP handling,
+        # which sets both. That mismatch is what let an opted-out patient's
+        # conversation_state stay at whatever it was before (e.g.
+        # 'awaiting_consent'), so views that group by conversation_state kept
+        # showing them under "awaiting response" instead of as opted out.
+        if updates.get('status') in ('opted-out', 'opted_out'):
+            updates['conversation_state'] = 'opted_out'
+
         # If the appointment date is being set/changed, clear any reminders
         # already sent so a new or rescheduled date is eligible for the full
         # set of configured reminders again.
