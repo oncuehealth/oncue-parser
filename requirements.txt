@@ -12,3 +12,4 @@ opencv-python-headless==4.9.0.80
 httpx==0.24.1
 google-auth==2.29.0
 requests==2.31.0
+phonenumbers==8.13.40
