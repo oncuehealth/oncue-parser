@@ -7,7 +7,11 @@ Migrated from Supabase to Google Cloud SQL (PostgreSQL) — July 2026
 import os
 import re
 import json
+import hmac
 import requests
+import phonenumbers
+from phonenumbers import timezone as phone_timezone
+from zoneinfo import ZoneInfo
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from google.oauth2 import id_token as google_id_token
@@ -80,6 +84,37 @@ def sms_capable_from_line_type(line_type):
     if line_type in ('landline', 'fixedVoip'):
         return False
     return None  # voicemail, tollFree, personal, unknown, or lookup error
+
+
+# TCPA permits automated/marketing SMS only between 8am and 9pm in the
+# RECIPIENT's local time — not the sender's. We don't store a patient's
+# actual time zone, so this infers it from their phone number's area code
+# via the phonenumbers library (Google's libphonenumber), which is the
+# standard practical approach absent more precise geolocation data. It's an
+# approximation (a number can be ported to a different region than its area
+# code implies), not a substitute for actual legal review, but it covers the
+# overwhelmingly common case correctly.
+DEFAULT_QUIET_HOURS_TZ = 'America/New_York'  # fallback when a number can't be parsed or has no mapped zone
+
+def local_time_for_phone(phone_number):
+    """Returns (datetime, tz_name) for the recipient's inferred local time, falling back to Eastern."""
+    tz_name = DEFAULT_QUIET_HOURS_TZ
+    try:
+        parsed = phonenumbers.parse(phone_number, 'US')
+        tzs = phone_timezone.time_zones_for_number(parsed)
+        if tzs:
+            tz_name = tzs[0]
+    except Exception:
+        pass
+    try:
+        return datetime.now(ZoneInfo(tz_name)), tz_name
+    except Exception:
+        return datetime.now(ZoneInfo(DEFAULT_QUIET_HOURS_TZ)), DEFAULT_QUIET_HOURS_TZ
+
+def is_quiet_hours(phone_number):
+    """True if it's currently before 8am or at/after 9pm in the recipient's inferred local time."""
+    local_now, _ = local_time_for_phone(phone_number)
+    return local_now.hour < 8 or local_now.hour >= 21
 
 
 def log_audit(cur, user, action, entity_type=None, entity_id=None, practice_id=None, details=None):
@@ -444,6 +479,13 @@ def sms_send():
             conn.close()
             return jsonify({'error': 'Not authorized for this patient'}), 403
 
+        to_number = patient.get('sms_number') or patient.get('phone')
+        if to_number and is_quiet_hours(to_number):
+            local_now, tz_name = local_time_for_phone(to_number)
+            cur.close()
+            conn.close()
+            return jsonify({'error': f"It's currently {local_now.strftime('%-I:%M %p')} for this patient ({tz_name.split('/')[-1].replace('_',' ')}) — sending is held until 8:00 AM their time to stay TCPA-compliant. Call them instead if this is urgent."}), 400
+
         try:
             msg = send_recall_sms(cur, patient, message=message)
         except ValueError as ve:
@@ -460,7 +502,7 @@ def sms_send():
 
     except Exception as e:
         log.error(f"SMS send failed for patient {patient_id}: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Send bulk SMS ─────────────────────────────────────────────────────────────
@@ -522,6 +564,11 @@ def sms_send_bulk():
                 results.append({'patient_id': patient_id, 'success': False, 'error': 'landline — call instead, not sent'})
                 continue
 
+            if is_quiet_hours(to_number):
+                local_now, tz_name = local_time_for_phone(to_number)
+                results.append({'patient_id': patient_id, 'success': False, 'error': f"quiet hours for this patient ({local_now.strftime('%-I:%M %p')} {tz_name.split('/')[-1].replace('_',' ')}) — not sent"})
+                continue
+
             if message:
                 body = message
             else:
@@ -569,7 +616,7 @@ def sms_send_bulk():
 
     except Exception as e:
         log.error(f"Bulk SMS send failed: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Inbound SMS webhook ────────────────────────────────────────────────────────
@@ -873,7 +920,11 @@ def run_daily_job():
        lighter, shorter window than the full recall cycle in task 1, since
        the patient already engaged once and this is just a missed reply).
     """
-    if not CRON_SECRET or request.args.get('key') != CRON_SECRET:
+    # Constant-time comparison — a plain != leaks timing information an
+    # attacker could use to guess the secret one character at a time. The
+    # secret only guards a reminder-sending job (not PHI access directly),
+    # so the risk was always low, but this is a one-line fix.
+    if not CRON_SECRET or not hmac.compare_digest(request.args.get('key', ''), CRON_SECRET):
         return jsonify({'error': 'Not authorized'}), 403
 
     pref_reengage_days = int(request.args.get('pref_reengage_days', 3))
@@ -885,6 +936,7 @@ def run_daily_job():
     reminder_errors = []
     pref_nudged = []
     pref_nudge_errors = []
+    quiet_hours_skipped = []
 
     try:
         conn = get_db()
@@ -912,6 +964,14 @@ def run_daily_job():
               AND COALESCE(array_length(p.recall_reminders_sent, 1), 0) < COALESCE(prac.max_recall_attempts, 3)
         """)
         for patient in cur.fetchall():
+            to_number = patient.get('sms_number') or patient.get('phone')
+            if to_number and is_quiet_hours(to_number):
+                # Don't consume an attempt or advance recall_reminders_sent —
+                # last_reengagement_sent_at stays untouched too, so this
+                # patient is simply re-evaluated on a later day's run instead
+                # of silently losing this cycle's reminder.
+                quiet_hours_skipped.append(patient['id'])
+                continue
             try:
                 send_recall_sms(cur, patient)
                 new_attempts = patient['attempts_sent'] + 1
@@ -955,6 +1015,10 @@ def run_daily_job():
               AND NOT ((p.appointment_date - CURRENT_DATE) = ANY(COALESCE(p.reminders_sent, ARRAY[]::integer[])))
         """)
         for patient in cur.fetchall():
+            to_number = patient.get('sms_number') or patient.get('phone')
+            if to_number and is_quiet_hours(to_number):
+                quiet_hours_skipped.append(patient['id'])
+                continue
             try:
                 days_until = patient['days_until']
                 first_name = (patient.get('name') or '').split(' ')[0] or 'there'
@@ -985,6 +1049,10 @@ def run_daily_job():
               AND COALESCE(p.last_reengagement_sent_at, p.last_contacted_at) < NOW() - INTERVAL '{pref_reengage_days} days'
         """)
         for patient in cur.fetchall():
+            to_number = patient.get('sms_number') or patient.get('phone')
+            if to_number and is_quiet_hours(to_number):
+                quiet_hours_skipped.append(patient['id'])
+                continue
             try:
                 send_recall_sms(cur, patient, message=RESCHEDULE_PREF_PROMPT, reset_conversation=False)
                 cur.execute("UPDATE patients SET last_reengagement_sent_at = NOW() WHERE id = %s", (patient['id'],))
@@ -997,17 +1065,18 @@ def run_daily_job():
         cur.close()
         conn.close()
 
-        log.info(f"Daily job: {len(reengaged)} recall reminders sent ({len(no_response)} hit the attempt cap), {len(reminded)} appointment reminders sent, {len(pref_nudged)} reschedule-pref nudges")
+        log.info(f"Daily job: {len(reengaged)} recall reminders sent ({len(no_response)} hit the attempt cap), {len(reminded)} appointment reminders sent, {len(pref_nudged)} reschedule-pref nudges, {len(quiet_hours_skipped)} held for quiet hours")
         return jsonify({
             'success': True,
             'reengaged': reengaged, 'reengage_errors': reengage_errors, 'no_response': no_response,
             'reminded': reminded, 'reminder_errors': reminder_errors,
             'pref_nudged': pref_nudged, 'pref_nudge_errors': pref_nudge_errors,
+            'quiet_hours_skipped': quiet_hours_skipped,
         })
 
     except Exception as e:
         log.error(f"Daily job failed: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Message templates (per practice) ──────────────────────────────────────────
@@ -1047,7 +1116,7 @@ def get_practices():
         return jsonify([dict(r) for r in rows])
     except Exception as e:
         log.error(f"Get practices failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/practices', methods=['POST'])
@@ -1086,7 +1155,7 @@ def create_practice():
         return jsonify(dict(row))
     except Exception as e:
         log.error(f"Create practice failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/practices/update', methods=['POST'])
@@ -1147,7 +1216,7 @@ def update_practice():
         return jsonify(dict(row))
     except Exception as e:
         log.error(f"Update practice failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/templates', methods=['GET'])
@@ -1181,7 +1250,7 @@ def get_template_route():
 
     except Exception as e:
         log.error(f"Get template failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/templates', methods=['POST'])
@@ -1229,7 +1298,7 @@ def save_template_route():
 
     except Exception as e:
         log.error(f"Save template failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Per-practice intake question configuration ───────────────────────────────
@@ -1264,7 +1333,7 @@ def get_intake_questions_route():
         return jsonify({'questions': questions})
     except Exception as e:
         log.error(f"Get intake questions failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/intake-questions', methods=['POST'])
@@ -1316,7 +1385,7 @@ def save_intake_questions_route():
         return jsonify({'success': True})
     except Exception as e:
         log.error(f"Save intake questions failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Get conversation history for a patient ───────────────────────────────────
@@ -1351,7 +1420,105 @@ def sms_conversations():
         return jsonify([dict(r) for r in rows])
     except Exception as e:
         log.error(f"Get conversations failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
+
+
+CALL_OUTCOMES = ('reached', 'voicemail', 'no_answer', 'wrong_number', 'scheduled_by_phone')
+
+@app.route('/patients/call-log', methods=['GET'])
+@require_auth
+def get_call_log():
+    """
+    GET /patients/call-log?patient_id=xxx
+    Returns this patient's logged call history, newest first. Caller must
+    have this patient in their scope.
+    """
+    patient_id = request.args.get('patient_id')
+    if not patient_id:
+        return jsonify({'error': 'patient_id required'}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        if not patient_in_scope(cur, patient_id, request.oncue_user):
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Not authorized for this patient'}), 403
+
+        cur.execute(
+            "SELECT * FROM call_log WHERE patient_id = %s ORDER BY created_at DESC",
+            (patient_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        log.error(f"Get call log failed: {e}")
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
+
+
+@app.route('/patients/log-call', methods=['POST'])
+@require_auth
+def log_call():
+    """
+    POST /patients/log-call
+    Body: JSON { patient_id, outcome, notes }
+    outcome must be one of CALL_OUTCOMES.
+
+    Call Queue surfaces exactly who needs a phone call (landline, opted out,
+    no response, call-requested) but previously had no way to record what
+    actually happened after that call — this closes that loop. Writes a row
+    to call_log (full history, same pattern as sms_conversations) and also
+    updates patients.last_call_outcome/last_call_at for a quick-glance
+    summary without needing to query the log table. A 'scheduled_by_phone'
+    outcome also marks the patient scheduled directly, since that's the
+    natural next step and saves a separate manual action.
+    """
+    data       = request.get_json()
+    patient_id = data.get('patient_id')
+    outcome    = data.get('outcome')
+    notes      = (data.get('notes') or '').strip() or None
+
+    if not patient_id or outcome not in CALL_OUTCOMES:
+        return jsonify({'error': f"patient_id and a valid outcome required (one of {', '.join(CALL_OUTCOMES)})"}), 400
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        patient = patient_in_scope(cur, patient_id, request.oncue_user)
+        if not patient:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Not authorized for this patient'}), 403
+
+        u = request.oncue_user
+        cur.execute("""
+            INSERT INTO call_log (patient_id, practice_id, outcome, notes, logged_by_id, logged_by_name)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (patient_id, patient.get('practice_id'), outcome, notes, u.get('id'), u.get('name')))
+        new_row = cur.fetchone()
+
+        update_fields = ['last_call_outcome = %s', 'last_call_at = NOW()']
+        update_values = [outcome]
+        if outcome == 'scheduled_by_phone':
+            update_fields.append('status = %s')
+            update_values.append('scheduled')
+            update_fields.append('scheduled_at = NOW()')
+        cur.execute(f"UPDATE patients SET {', '.join(update_fields)} WHERE id = %s", update_values + [patient_id])
+
+        log_audit(cur, u, 'patient.log_call', entity_type='patient', entity_id=patient_id,
+                  practice_id=patient.get('practice_id'), details={'outcome': outcome})
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(dict(new_row))
+    except Exception as e:
+        log.error(f"Log call failed: {e}")
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Parse PDF endpoint ──────────────────────────────────────────────────────
@@ -1453,7 +1620,7 @@ def parse():
 
     except Exception as e:
         log.error(f"Parse failed: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
     finally:
         try:
@@ -1573,7 +1740,7 @@ def save_patients():
 
     except Exception as e:
         log.error(f"Cloud SQL save failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Create user endpoint ────────────────────────────────────────────────────
@@ -1650,7 +1817,7 @@ def create_user():
 
     except Exception as e:
         log.error(f"Create user failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Delete practice endpoint ────────────────────────────────────────────────
@@ -1703,7 +1870,7 @@ def delete_practice():
 
     except Exception as e:
         log.error(f"Delete practice failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Get profile by Firebase UID ─────────────────────────────────────────────
@@ -1749,7 +1916,7 @@ def get_profile():
 
     except Exception as e:
         log.error(f"Get profile failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/profile/update', methods=['POST'])
@@ -1775,7 +1942,7 @@ def update_profile():
         return jsonify(dict(row))
     except Exception as e:
         log.error(f"Update profile failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Get patients ─────────────────────────────────────────────────────────────
@@ -1823,7 +1990,7 @@ def get_patients():
 
     except Exception as e:
         log.error(f"Get patients failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Message-count analytics ──────────────────────────────────────────────────
@@ -1878,7 +2045,7 @@ def analytics_messages():
         })
     except Exception as e:
         log.error(f"Analytics messages failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/analytics/trend', methods=['GET'])
@@ -2001,7 +2168,7 @@ def analytics_trend():
 
     except Exception as e:
         log.error(f"Analytics trend failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/audit-log', methods=['GET'])
@@ -2033,7 +2200,7 @@ def get_audit_log():
         return jsonify([dict(r) for r in rows])
     except Exception as e:
         log.error(f"Get audit log failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Get providers ─────────────────────────────────────────────────────────────
@@ -2086,7 +2253,7 @@ def get_providers():
         return jsonify([dict(r) for r in rows])
     except Exception as e:
         log.error(f"Get providers failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Update patient ─────────────────────────────────────────────────────────────
@@ -2191,7 +2358,7 @@ def update_patient():
         return jsonify({'success': True, 'phone_type': updates.get('phone_type'), 'sms_capable': updates.get('sms_capable')})
     except Exception as e:
         log.error(f"Update patient failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Delete a patient ─────────────────────────────────────────────────────────
@@ -2236,7 +2403,7 @@ def delete_patient():
         return jsonify({'success': True})
     except Exception as e:
         log.error(f"Delete patient failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Live phone re-check (Twilio Lookup Line Type Intelligence) ──────────────
@@ -2315,7 +2482,7 @@ def recheck_phone():
         })
     except Exception as e:
         log.error(f"Recheck phone failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── Add single patient ─────────────────────────────────────────────────────────
@@ -2397,7 +2564,7 @@ def add_recall():
         return jsonify(dict(new_row))
     except Exception as e:
         log.error(f"Add recall failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 @app.route('/patients/add', methods=['POST'])
@@ -2488,7 +2655,7 @@ def add_patient():
         return jsonify(dict(row))
     except Exception as e:
         log.error(f"Add patient failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'An unexpected error occurred. Please try again or contact support if the problem persists.'}), 500
 
 
 # ── CSV parser helper ───────────────────────────────────────────────────────
