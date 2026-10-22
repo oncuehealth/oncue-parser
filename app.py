@@ -155,10 +155,9 @@ def log_conversation(cur, practice_id, patient_id, direction, body, twilio_sid=N
 # Placeholders: {patient_name} {doctor_name} {practice_name} {procedure}
 DEFAULT_TEMPLATE = (
     "Hi {patient_name}, this is Dr. {doctor_name} from {practice_name}. We see that you are "
-    "due for your {procedure}. We would love to help you get it scheduled in an expedited and "
-    "efficient manner. Are you able to answer some questions so that we can get it scheduled? "
-    "If you would like a call instead of using our automated HIPAA-compliant text platform, "
-    "please text CALL."
+    "due for your {procedure} and would love to get it scheduled. Are you able to answer some "
+    "questions? If so, text YES. If you would like a call instead of using our automated "
+    "HIPAA-compliant text platform, please text CALL. If already scheduled or completed, text DONE."
 )
 
 def get_template_for_practice(cur, practice_id):
@@ -399,6 +398,11 @@ def get_intake_questions(cur, practice_id):
     return result
 
 CALL_REQUEST_KEYWORDS = ('CALL', 'PHONE', 'SPEAK', 'TALK')
+# Patient says they already had the procedure done, or already scheduled it
+# themselves outside this system — this is the fix for recall lists not
+# filtering out patients who'd already completed/scheduled elsewhere, since
+# that information only existed outside OnCue until the patient tells us.
+DONE_KEYWORDS = ('DONE', 'COMPLETE', 'COMPLETED', 'ALREADY DONE', 'ALREADY SCHEDULED', 'ALREADY COMPLETED')
 YES_KEYWORDS          = ('YES', 'Y', 'SURE', 'OK', 'OKAY')
 NO_KEYWORDS           = ('NO', 'N')
 STOP_KEYWORDS         = ('STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'OPTOUT', 'REVOKE')
@@ -557,6 +561,14 @@ def sms_send_bulk():
                 results.append({'patient_id': patient_id, 'success': False, 'error': 'no phone on file'})
                 continue
 
+            if patient.get('status') in ('already-done', 'already_done'):
+                # Patient told us they already had this done or scheduled it
+                # elsewhere — texting them again would be exactly the
+                # "recall list didn't filter this patient out" problem this
+                # whole status exists to fix.
+                results.append({'patient_id': patient_id, 'success': False, 'error': 'already scheduled/completed — not sent'})
+                continue
+
             if patient.get('sms_capable') is False:
                 # Known landline from the upload-time Lookup — don't waste a
                 # send attempt that's already known to fail (and would just
@@ -684,6 +696,16 @@ def sms_webhook():
                     ('ready_to_schedule_call_requested', 'call_requested', 'call', patient_id),
                 )
                 reply_text = "Got it — we'll have someone from the practice give you a call to go over scheduling. Thank you!"
+
+            # Already scheduled or completed elsewhere — also works at any
+            # stage, since a patient partway through intake questions might
+            # realize mid-conversation that they don't need to continue.
+            elif any(kw in body_upper for kw in DONE_KEYWORDS):
+                cur.execute(
+                    "UPDATE patients SET status = %s, conversation_state = %s WHERE id = %s",
+                    ('already_done', 'already_done', patient_id),
+                )
+                reply_text = "Thanks for letting us know — we'll update our records. Have a great day!"
 
             elif body_upper in STOP_KEYWORDS:
                 cur.execute(
@@ -2337,6 +2359,12 @@ def update_patient():
         # showing them under "awaiting response" instead of as opted out.
         if updates.get('status') in ('opted-out', 'opted_out'):
             updates['conversation_state'] = 'opted_out'
+
+        # Same reasoning as opted-out above — keep conversation_state in sync
+        # when staff set this manually, matching what the webhook's DONE
+        # handling already does when the patient says it themselves.
+        if updates.get('status') in ('already-done', 'already_done'):
+            updates['conversation_state'] = 'already_done'
 
         # If the appointment date is being set/changed, clear any reminders
         # already sent so a new or rescheduled date is eligible for the full
