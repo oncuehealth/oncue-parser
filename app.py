@@ -969,20 +969,37 @@ def run_daily_job():
         # pattern, just measured forward from last contact instead of backward
         # from a future appointment date. attempts_sent is how many recall
         # reminders this patient has already received in their current cycle.
+        #
+        # target_offset is the SMALLEST configured day-offset this patient
+        # hasn't already received (via a LATERAL subquery), and the match
+        # condition is days_since_contact >= target_offset — "has reached or
+        # passed it" — rather than the old "is exactly equal to it". An exact
+        # match means a patient who's silent for any reason the job doesn't
+        # run on their precise day (an outage, a missed scheduler run, this
+        # feature not existing yet when they were uploaded) never matches
+        # again, ever, since their day-count only climbs from there and will
+        # never land back on exactly 1/3/7/30. >= catches them on the very
+        # next run instead, then proceeds through their remaining offsets at
+        # the normal cadence from that point (last_reengagement_sent_at still
+        # resets on each send, so it's not a burst of all offsets at once).
         cur.execute("""
             SELECT p.*, pr.name AS doctor_name, prac.name AS practice_name,
                    COALESCE(prac.recall_reminder_days, ARRAY[1,3,7,30]) AS recall_reminder_days,
                    COALESCE(prac.max_recall_attempts, 3) AS max_recall_attempts,
                    (CURRENT_DATE - COALESCE(p.last_reengagement_sent_at, p.last_contacted_at)::date) AS days_since_contact,
-                   COALESCE(array_length(p.recall_reminders_sent, 1), 0) AS attempts_sent
+                   COALESCE(array_length(p.recall_reminders_sent, 1), 0) AS attempts_sent,
+                   next_offset.offset_days AS target_offset
             FROM patients p
             LEFT JOIN profiles pr    ON pr.id   = p.provider_id
             LEFT JOIN practices prac ON prac.id = p.practice_id
+            CROSS JOIN LATERAL (
+                SELECT MIN(d) AS offset_days
+                FROM unnest(COALESCE(prac.recall_reminder_days, ARRAY[1,3,7,30])) AS d
+                WHERE NOT (d = ANY(COALESCE(p.recall_reminders_sent, ARRAY[]::integer[])))
+            ) AS next_offset
             WHERE p.conversation_state IN ('awaiting_consent', 'follow_up_later')
-              AND (CURRENT_DATE - COALESCE(p.last_reengagement_sent_at, p.last_contacted_at)::date)
-                    = ANY(COALESCE(prac.recall_reminder_days, ARRAY[1,3,7,30]))
-              AND NOT ((CURRENT_DATE - COALESCE(p.last_reengagement_sent_at, p.last_contacted_at)::date)
-                    = ANY(COALESCE(p.recall_reminders_sent, ARRAY[]::integer[])))
+              AND next_offset.offset_days IS NOT NULL
+              AND (CURRENT_DATE - COALESCE(p.last_reengagement_sent_at, p.last_contacted_at)::date) >= next_offset.offset_days
               AND COALESCE(array_length(p.recall_reminders_sent, 1), 0) < COALESCE(prac.max_recall_attempts, 3)
         """)
         for patient in cur.fetchall():
@@ -1004,13 +1021,13 @@ def run_daily_job():
                     # category for staff rather than silently retrying forever.
                     cur.execute(
                         "UPDATE patients SET recall_reminders_sent = array_append(COALESCE(recall_reminders_sent, ARRAY[]::integer[]), %s), last_reengagement_sent_at = NOW(), status = 'no_response' WHERE id = %s",
-                        (patient['days_since_contact'], patient['id'])
+                        (patient['target_offset'], patient['id'])
                     )
                     no_response.append(patient['id'])
                 else:
                     cur.execute(
                         "UPDATE patients SET recall_reminders_sent = array_append(COALESCE(recall_reminders_sent, ARRAY[]::integer[]), %s), last_reengagement_sent_at = NOW() WHERE id = %s",
-                        (patient['days_since_contact'], patient['id'])
+                        (patient['target_offset'], patient['id'])
                     )
                 reengaged.append(patient['id'])
             except Exception as e:
